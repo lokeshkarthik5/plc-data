@@ -17,6 +17,56 @@ MULTICAST_GROUP = '239.255.43.21'
 RTU_LISTEN_PORT = 4001     # PLC listens here (SCADA -> RTU)
 RTU_SEND_PORT = 9001       # PLC sends from here (RTU -> SCADA)
 RTU_NUMBER = 1             # Must match the IF RTU_NO = 1 gate in PLC code
+REPLY_TIMEOUT_SEC = 0.5    # How long to wait for an RTU reply after each send
+HEADER_SIZE = 10           # RTU_NO + 4 x uint16 counts (little-endian)
+
+
+def parse_rtu_header(data):
+    """Parse the 10-byte RTU packet header. Returns None if too short."""
+    if len(data) < HEADER_SIZE:
+        return None
+    rtu_no, pdo_c, ddo_c, pao_c, dao_c = struct.unpack('<HHHHH', data[:HEADER_SIZE])
+    return {
+        'rtu_no': rtu_no,
+        'pdo_count': pdo_c,
+        'ddo_count': ddo_c,
+        'pao_count': pao_c,
+        'dao_count': dao_c,
+    }
+
+
+def drain_socket(sock):
+    """Discard any queued UDP packets before a new send."""
+    sock.setblocking(False)
+    try:
+        while True:
+            sock.recvfrom(4096)
+    except BlockingIOError:
+        pass
+    finally:
+        sock.setblocking(True)
+
+
+def wait_for_rtu_reply(sock, expected_rtu, timeout_sec):
+    """
+    Wait for a UDP reply whose header RTU_NO matches expected_rtu.
+    Returns (ok, header_dict, raw_bytes, sender_addr).
+    """
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, None, None, None
+        sock.settimeout(remaining)
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            return False, None, None, None
+        header = parse_rtu_header(data)
+        if header is None:
+            continue
+        if header['rtu_no'] == expected_rtu:
+            return True, header, data, addr
 
 
 def build_scada_packet(rtu_no, pdo_rows, ddo_rows, pao_rows, dao_rows):
@@ -74,6 +124,7 @@ class CSVtoPLCApp:
         self.plc_ip = tk.StringVar(value=MULTICAST_GROUP)
         self.plc_port = tk.StringVar(value=str(RTU_LISTEN_PORT))
         self.listen_port = tk.StringVar(value=str(RTU_SEND_PORT))
+        self.status_text = tk.StringVar(value='Ready')
         self.is_sending = False
 
         self._build_ui()
@@ -116,23 +167,15 @@ class CSVtoPLCApp:
         ttk.Label(data_frame, textvariable=self.col2_name, foreground='gray').grid(row=1, column=1, sticky='w', padx=5)
         ttk.Label(data_frame, textvariable=self.col3_name, foreground='gray').grid(row=2, column=1, sticky='w', padx=5)
 
-        # --- Column data preview ---
-        preview_frame = ttk.LabelFrame(self.root, text='Column data')
-        preview_frame.pack(fill='both', expand=True, **pad)
+        # --- Log ---
+        log_frame = ttk.LabelFrame(self.root, text='Log')
+        log_frame.pack(fill='both', expand=True, **pad)
 
-        tree_container = ttk.Frame(preview_frame)
-        tree_container.pack(fill='both', expand=True, padx=5, pady=5)
-
-        self.data_tree = ttk.Treeview(tree_container, show='headings', height=10)
-        tree_y = ttk.Scrollbar(tree_container, orient='vertical', command=self.data_tree.yview)
-        tree_x = ttk.Scrollbar(tree_container, orient='horizontal', command=self.data_tree.xview)
-        self.data_tree.configure(yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
-
-        self.data_tree.grid(row=0, column=0, sticky='nsew')
-        tree_y.grid(row=0, column=1, sticky='ns')
-        tree_x.grid(row=1, column=0, sticky='ew')
-        tree_container.rowconfigure(0, weight=1)
-        tree_container.columnconfigure(0, weight=1)
+        self.log_box = tk.Text(log_frame, height=16, wrap='word')
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=scrollbar.set)
+        self.log_box.pack(side='left', fill='both', expand=True, padx=(5, 0), pady=5)
+        scrollbar.pack(side='right', fill='y', pady=5)
 
         # --- Action button ---
         btn_frame = ttk.Frame(self.root)
@@ -145,19 +188,16 @@ class CSVtoPLCApp:
                                   height=2)
         self.send_btn.pack(fill='x', padx=10)
 
+        # --- Send status ---
+        status_frame = ttk.Frame(self.root)
+        status_frame.pack(fill='x', padx=20, pady=(0, 5))
+        ttk.Label(status_frame, text='Status:').pack(side='left')
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_text)
+        self.status_label.pack(side='left', padx=(5, 0))
+
         # --- Progress bar ---
         self.progress = ttk.Progressbar(self.root, mode='determinate')
         self.progress.pack(fill='x', padx=20, pady=5)
-
-        # --- Log ---
-        log_frame = ttk.LabelFrame(self.root, text='Log')
-        log_frame.pack(fill='both', expand=True, **pad)
-
-        self.log_box = tk.Text(log_frame, height=8, wrap='word')
-        scrollbar = ttk.Scrollbar(log_frame, command=self.log_box.yview)
-        self.log_box.configure(yscrollcommand=scrollbar.set)
-        self.log_box.pack(side='left', fill='both', expand=True, padx=(5, 0), pady=5)
-        scrollbar.pack(side='right', fill='y', pady=5)
 
     # ---------- Actions (UNCHANGED CSV LOGIC) ----------
 
@@ -178,28 +218,21 @@ class CSVtoPLCApp:
             self.col1_name.set(cols[0])
             self.col2_name.set(cols[1])
             self.col3_name.set(cols[2])
-            self._refresh_data_table()
             self.log(f'Loaded {len(self.df)} rows from {path}')
             self.log(f'Using columns: {", ".join(cols)}')
         except Exception as e:
             messagebox.showerror('Error reading CSV', str(e))
 
-    def _refresh_data_table(self):
-        for item in self.data_tree.get_children():
-            self.data_tree.delete(item)
-        if self.df is None:
-            return
-        cols = [str(c) for c in self.df.columns]
-        self.data_tree['columns'] = cols
-        for col in cols:
-            self.data_tree.heading(col, text=col)
-            self.data_tree.column(col, width=140, minwidth=80, anchor='w')
-        for row in self.df.itertuples(index=False):
-            self.data_tree.insert('', tk.END, values=tuple(str(v) for v in row))
-
     def log(self, msg):
         self.log_box.insert(tk.END, msg + '\n')
         self.log_box.see(tk.END)
+
+    def set_status(self, msg, color=''):
+        def _update():
+            self.status_text.set(msg)
+            if color:
+                self.status_label.configure(foreground=color)
+        self.root.after(0, _update)
 
     def start_send(self):
         if self.is_sending:
@@ -210,7 +243,8 @@ class CSVtoPLCApp:
         # Run network work in a thread so UI stays responsive
         self.is_sending = True
         self.send_btn.config(state='disabled', text='Sending...')
-        thread = threading.Thread(target=self._send_worker, daemon=True).start()
+        self.set_status('Sending…', 'blue')
+        threading.Thread(target=self._send_worker, daemon=True).start()
 
     # ---------- Network (REWRITTEN FOR CODESYS RTU MULTICAST) ----------
 
@@ -233,7 +267,6 @@ class CSVtoPLCApp:
                 recv_sock.bind(('', listen_port))
                 mreq = struct.pack('4sl', socket.inet_aton(group), socket.INADDR_ANY)
                 recv_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-                recv_sock.settimeout(0.3)
                 reply_enabled = True
             except OSError as e:
                 self.log(f'(reply listener disabled: {e})')
@@ -241,15 +274,24 @@ class CSVtoPLCApp:
 
             total = len(self.df)
             self.progress['maximum'] = total
+            ok_count = 0
+            no_reply_count = 0
+            err_count = 0
+
             self.log(f'--- Starting send to {group}:{send_port} (RTU={RTU_NUMBER}) ---')
+            if reply_enabled:
+                self.log(f'Listening for PLC replies on port {listen_port} '
+                         f'(timeout {REPLY_TIMEOUT_SEC}s per row)')
+            else:
+                self.log('Cannot verify PLC acceptance (reply listener unavailable)')
 
             for i, row in enumerate(self.df.itertuples(index=False)):
+                row_no = i + 1
                 try:
                     channel = int(row[0])
                     pao_val = float(row[1])
                     dao_val = float(row[2])
 
-                    # One row = one PAO write + one DAO write on the same channel
                     packet = build_scada_packet(
                         rtu_no=RTU_NUMBER,
                         pdo_rows=[],
@@ -258,36 +300,82 @@ class CSVtoPLCApp:
                         dao_rows=[(channel, dao_val)],
                     )
 
-                    send_sock.sendto(packet, (group, send_port))
-                    self.log(f'[{i+1}/{total}] ch={channel} PAO={pao_val} DAO={dao_val} '
-                             f'-> {len(packet)} bytes: {packet.hex()}')
-
-                    # Optional: brief listen for RTU reply
                     if reply_enabled:
-                        try:
-                            data, addr = recv_sock.recvfrom(4096)
-                            self.log(f'    reply from {addr}: {len(data)}B first32={data[:32].hex()}')
-                        except socket.timeout:
-                            pass
+                        drain_socket(recv_sock)
+
+                    send_sock.sendto(packet, (group, send_port))
+
+                    if not reply_enabled:
+                        self.log(f'[{row_no}/{total}] SENT ch={channel} '
+                                 f'(not verified — no reply listener)')
+                    else:
+                        got_reply, hdr, data, addr = wait_for_rtu_reply(
+                            recv_sock, RTU_NUMBER, REPLY_TIMEOUT_SEC
+                        )
+                        if got_reply:
+                            ok_count += 1
+                            self.log(
+                                f'[{row_no}/{total}] OK ch={channel} — PLC replied from {addr[0]}:{addr[1]} '
+                                f'({len(data)}B, RTU={hdr["rtu_no"]}, '
+                                f'PDO={hdr["pdo_count"]} DDO={hdr["ddo_count"]} '
+                                f'PAO={hdr["pao_count"]} DAO={hdr["dao_count"]})'
+                            )
+                        else:
+                            no_reply_count += 1
+                            self.log(
+                                f'[{row_no}/{total}] UNCONFIRMED ch={channel} — '
+                                f'sent {len(packet)}B, no RTU reply within {REPLY_TIMEOUT_SEC}s'
+                            )
 
                 except Exception as e:
-                    self.log(f'[{i+1}/{total}] ERROR: {e}')
+                    err_count += 1
+                    self.log(f'[{row_no}/{total}] FAILED: {e}')
 
-                self.progress['value'] = i + 1
-                time.sleep(0.05)  # small pacing gap
+                self.progress['value'] = row_no
+                time.sleep(0.05)
 
-            self.log('--- Done ---')
+            if reply_enabled:
+                summary = (f'Done: {ok_count} confirmed, {no_reply_count} unconfirmed, '
+                           f'{err_count} failed (of {total})')
+            else:
+                summary = f'Done: {total} sent (PLC reply check disabled)'
+            self.log(f'--- {summary} ---')
+
+            if not reply_enabled:
+                color = 'darkorange'
+            elif err_count or (no_reply_count == total):
+                color = 'red'
+            elif no_reply_count:
+                color = 'darkorange'
+            elif ok_count == total:
+                color = 'green'
+            else:
+                color = 'green'
+            self.set_status(summary, color)
+
+            if reply_enabled and (err_count or no_reply_count):
+                self.root.after(
+                    0,
+                    lambda: messagebox.showwarning(
+                        'Send finished with issues',
+                        summary + '\n\n'
+                        'OK = PLC sent a reply on the listen port.\n'
+                        'Unconfirmed = packet was sent but no matching RTU reply was received.\n'
+                        'Failed = local error building or sending the row.',
+                    ),
+                )
 
         except Exception as e:
             self.log(f'FATAL: {e}')
-            messagebox.showerror('Send failed', str(e))
+            self.set_status(f'Failed: {e}', 'red')
+            self.root.after(0, lambda: messagebox.showerror('Send failed', str(e)))
         finally:
             if send_sock:
                 send_sock.close()
             if recv_sock:
                 recv_sock.close()
             self.is_sending = False
-            self.send_btn.config(state='normal', text='Send to PLC')
+            self.root.after(0, lambda: self.send_btn.config(state='normal', text='Send to PLC'))
 
 
 if __name__ == '__main__':
