@@ -1,8 +1,3 @@
-"""
-CSV to PLC over UDP
-Run: python3 app.py
-"""
-
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import socket
@@ -107,6 +102,18 @@ def build_scada_packet(rtu_no, pdo_rows, ddo_rows, pao_rows, dao_rows):
             + dao_ch + dao_val)
 
 
+def column_flag(prefix, index):
+    """Build a row flag like $s1 or $e2."""
+    return f'${prefix}{index}'.encode('ascii')
+
+
+# Each data column pass: (csv_col_index, label, build_rows_fn)
+SEND_COLUMNS = (
+    (2, 'PAO', lambda channel, val: ([(channel, val)], [])),
+    (3, 'DAO', lambda channel, val: ([], [(channel, val)])),
+)
+
+
 class CSVtoPLCApp:
     def __init__(self, root):
         self.root = root
@@ -157,8 +164,8 @@ class CSVtoPLCApp:
         data_frame.pack(fill='x', **pad)
 
         ttk.Label(data_frame, text='Column 1 → Channel number (uint16)').grid(row=0, column=0, sticky='w', padx=10, pady=2)
-        ttk.Label(data_frame, text='Column 2 → PAO value (float32)').grid(row=1, column=0, sticky='w', padx=10, pady=2)
-        ttk.Label(data_frame, text='Column 3 → DAO value (float32)').grid(row=2, column=0, sticky='w', padx=10, pady=2)
+        ttk.Label(data_frame, text='Column 2 → PAO value (float32, sent first)').grid(row=1, column=0, sticky='w', padx=10, pady=2)
+        ttk.Label(data_frame, text='Column 3 → DAO value (float32, sent second)').grid(row=2, column=0, sticky='w', padx=10, pady=2)
 
         self.col1_name = tk.StringVar(value='—')
         self.col2_name = tk.StringVar(value='—')
@@ -246,6 +253,44 @@ class CSVtoPLCApp:
         self.set_status('Sending…', 'blue')
         threading.Thread(target=self._send_worker, daemon=True).start()
 
+    def _send_flag(self, send_sock, group, send_port, flag_bytes, label):
+        """Send a start/end flag packet ($sN / $eN)."""
+        send_sock.sendto(flag_bytes, (group, send_port))
+        self.log(f'  FLAG {label} -> {flag_bytes.decode("ascii")}')
+
+    def _send_one_packet(self, send_sock, recv_sock, group, send_port, reply_enabled,
+                         step_no, total_steps, label, channel, value, packet):
+        """Send one UDP packet and optionally wait for RTU reply. Returns ok|unconfirmed|sent|failed."""
+        try:
+            if reply_enabled:
+                drain_socket(recv_sock)
+            send_sock.sendto(packet, (group, send_port))
+
+            if not reply_enabled:
+                self.log(f'[{step_no}/{total_steps}] SENT {label} ch={channel} val={value} '
+                         f'(not verified — no reply listener)')
+                return 'sent'
+
+            got_reply, hdr, data, addr = wait_for_rtu_reply(
+                recv_sock, RTU_NUMBER, REPLY_TIMEOUT_SEC
+            )
+            if got_reply:
+                self.log(
+                    f'[{step_no}/{total_steps}] OK {label} ch={channel} val={value} — '
+                    f'PLC replied from {addr[0]}:{addr[1]} ({len(data)}B, RTU={hdr["rtu_no"]}, '
+                    f'PDO={hdr["pdo_count"]} DDO={hdr["ddo_count"]} '
+                    f'PAO={hdr["pao_count"]} DAO={hdr["dao_count"]})'
+                )
+                return 'ok'
+            self.log(
+                f'[{step_no}/{total_steps}] UNCONFIRMED {label} ch={channel} val={value} — '
+                f'sent {len(packet)}B, no RTU reply within {REPLY_TIMEOUT_SEC}s'
+            )
+            return 'unconfirmed'
+        except Exception as e:
+            self.log(f'[{step_no}/{total_steps}] FAILED {label} ch={channel}: {e}')
+            return 'failed'
+
     # ---------- Network (REWRITTEN FOR CODESYS RTU MULTICAST) ----------
 
     def _send_worker(self):
@@ -272,82 +317,95 @@ class CSVtoPLCApp:
                 self.log(f'(reply listener disabled: {e})')
                 reply_enabled = False
 
-            total = len(self.df)
-            self.progress['maximum'] = total
+            total_rows = len(self.df)
+            # Per row: start flag + data + end flag, for each data column pass
+            total_steps = total_rows * len(SEND_COLUMNS) * 3
+            self.progress['maximum'] = total_steps
             ok_count = 0
             no_reply_count = 0
             err_count = 0
+            step_no = 0
 
             self.log(f'--- Starting send to {group}:{send_port} (RTU={RTU_NUMBER}) ---')
+            self.log('Order: all PAO (column 2) first, then all DAO (column 3); '
+                     'each row wrapped with $sN / $eN flags')
             if reply_enabled:
                 self.log(f'Listening for PLC replies on port {listen_port} '
-                         f'(timeout {REPLY_TIMEOUT_SEC}s per row)')
+                         f'(timeout {REPLY_TIMEOUT_SEC}s per packet)')
             else:
                 self.log('Cannot verify PLC acceptance (reply listener unavailable)')
 
-            for i, row in enumerate(self.df.itertuples(index=False)):
-                row_no = i + 1
-                try:
-                    channel = int(row[0])
-                    pao_val = float(row[1])
-                    dao_val = float(row[2])
-
-                    packet = build_scada_packet(
-                        rtu_no=RTU_NUMBER,
-                        pdo_rows=[],
-                        ddo_rows=[],
-                        pao_rows=[(channel, pao_val)],
-                        dao_rows=[(channel, dao_val)],
-                    )
-
-                    if reply_enabled:
-                        drain_socket(recv_sock)
-
-                    send_sock.sendto(packet, (group, send_port))
-
-                    if not reply_enabled:
-                        self.log(f'[{row_no}/{total}] SENT ch={channel} '
-                                 f'(not verified — no reply listener)')
-                    else:
-                        got_reply, hdr, data, addr = wait_for_rtu_reply(
-                            recv_sock, RTU_NUMBER, REPLY_TIMEOUT_SEC
-                        )
-                        if got_reply:
-                            ok_count += 1
-                            self.log(
-                                f'[{row_no}/{total}] OK ch={channel} — PLC replied from {addr[0]}:{addr[1]} '
-                                f'({len(data)}B, RTU={hdr["rtu_no"]}, '
-                                f'PDO={hdr["pdo_count"]} DDO={hdr["ddo_count"]} '
-                                f'PAO={hdr["pao_count"]} DAO={hdr["dao_count"]})'
-                            )
-                        else:
-                            no_reply_count += 1
-                            self.log(
-                                f'[{row_no}/{total}] UNCONFIRMED ch={channel} — '
-                                f'sent {len(packet)}B, no RTU reply within {REPLY_TIMEOUT_SEC}s'
-                            )
-
-                except Exception as e:
+            def tally(result):
+                nonlocal ok_count, no_reply_count, err_count
+                if result == 'ok' or result == 'sent':
+                    ok_count += 1
+                elif result == 'unconfirmed':
+                    no_reply_count += 1
+                elif result == 'failed':
                     err_count += 1
-                    self.log(f'[{row_no}/{total}] FAILED: {e}')
 
-                self.progress['value'] = row_no
+            def advance():
+                nonlocal step_no
+                step_no += 1
+                self.progress['value'] = step_no
                 time.sleep(0.05)
+
+            for pass_no, (csv_col, col_label, build_rows) in enumerate(SEND_COLUMNS, start=1):
+                self.log(f'--- Pass {pass_no}: {col_label} (column {csv_col}) '
+                         f'— $sN / $eN per row (N = 1..{total_rows}) ---')
+                for i, row in enumerate(self.df.itertuples(index=False)):
+                    row_no = i + 1
+                    start_flag = column_flag('s', row_no)
+                    end_flag = column_flag('e', row_no)
+
+                    try:
+                        advance()
+                        self._send_flag(
+                            send_sock, group, send_port, start_flag,
+                            f'{col_label} row {row_no} start',
+                        )
+
+                        channel = int(row[0])
+                        value = float(row[csv_col - 1])
+                        pao_rows, dao_rows = build_rows(channel, value)
+                        packet = build_scada_packet(
+                            rtu_no=RTU_NUMBER,
+                            pdo_rows=[],
+                            ddo_rows=[],
+                            pao_rows=pao_rows,
+                            dao_rows=dao_rows,
+                        )
+                        advance()
+                        result = self._send_one_packet(
+                            send_sock, recv_sock, group, send_port, reply_enabled,
+                            step_no, total_steps,
+                            f'{col_label} row {row_no}', channel, value, packet,
+                        )
+                        tally(result)
+
+                        advance()
+                        self._send_flag(
+                            send_sock, group, send_port, end_flag,
+                            f'{col_label} row {row_no} end',
+                        )
+                    except Exception as e:
+                        self.log(f'[{step_no}/{total_steps}] FAILED {col_label} row {row_no}: {e}')
+                        tally('failed')
 
             if reply_enabled:
                 summary = (f'Done: {ok_count} confirmed, {no_reply_count} unconfirmed, '
-                           f'{err_count} failed (of {total})')
+                           f'{err_count} failed (of {total_steps} packets)')
             else:
-                summary = f'Done: {total} sent (PLC reply check disabled)'
+                summary = f'Done: {total_steps} sent (PLC reply check disabled)'
             self.log(f'--- {summary} ---')
 
             if not reply_enabled:
                 color = 'darkorange'
-            elif err_count or (no_reply_count == total):
+            elif err_count or (no_reply_count == total_steps):
                 color = 'red'
             elif no_reply_count:
                 color = 'darkorange'
-            elif ok_count == total:
+            elif ok_count == total_steps:
                 color = 'green'
             else:
                 color = 'green'
@@ -361,7 +419,7 @@ class CSVtoPLCApp:
                         summary + '\n\n'
                         'OK = PLC sent a reply on the listen port.\n'
                         'Unconfirmed = packet was sent but no matching RTU reply was received.\n'
-                        'Failed = local error building or sending the row.',
+                        'Failed = local error building or sending a packet.',
                     ),
                 )
 
