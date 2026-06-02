@@ -24,7 +24,7 @@ jobs:
         run: pyinstaller --onefile --windowed --name CSV_to_PLC app.py
 
       - name: Upload EXE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4 
         with:
           name: CSV_to_PLC-windows
           path: dist/CSV_to_PLC.exe
