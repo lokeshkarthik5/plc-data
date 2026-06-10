@@ -133,6 +133,73 @@ def describe_scada_payload(pao_rows, dao_rows):
     return ' + '.join(parts) if parts else '(empty data blocks)'
 
 
+def rtu_packet_format_summary():
+    """One-line description of the on-wire RTU packet layout."""
+    return (
+        'RTU UDP packet (little-endian): '
+        'header 10B [RTU_NO uint16, PDO_cnt uint16, DDO_cnt uint16, PAO_cnt uint16, DAO_cnt uint16]; '
+        'PDO: ch uint16 + val uint8 each; DDO: ch uint16 + val uint8 each; '
+        'PAO: ch uint16 + val float32 each; DAO: ch uint16 + val float32 each'
+    )
+
+
+def describe_flag_packet(flag_bytes):
+    """Byte size and format for $sN / $eN flag packets."""
+    text = flag_bytes.decode('ascii')
+    return f'{len(flag_bytes)}B, format=ASCII flag "{text}"'
+
+
+def describe_data_packet(packet):
+    """Byte size, field layout, and hex dump for an RTU data packet."""
+    size = len(packet)
+    if size < HEADER_SIZE:
+        return f'{size}B, format=invalid (header too short), hex={packet.hex(" ")}'
+
+    hdr = parse_rtu_header(packet)
+    offset = HEADER_SIZE
+    parts = [
+        f'{size}B',
+        'format=RTU SCADA',
+        f'header[RTU={hdr["rtu_no"]} PDO={hdr["pdo_count"]} DDO={hdr["ddo_count"]} '
+        f'PAO={hdr["pao_count"]} DAO={hdr["dao_count"]}]',
+    ]
+
+    for _ in range(hdr['pdo_count']):
+        if offset + 3 > size:
+            break
+        ch, = struct.unpack_from('<H', packet, offset)
+        val, = struct.unpack_from('<B', packet, offset + 2)
+        parts.append(f'PDO ch={ch} val={val}')
+        offset += 3
+
+    for _ in range(hdr['ddo_count']):
+        if offset + 3 > size:
+            break
+        ch, = struct.unpack_from('<H', packet, offset)
+        val, = struct.unpack_from('<B', packet, offset + 2)
+        parts.append(f'DDO ch={ch} val={val}')
+        offset += 3
+
+    for _ in range(hdr['pao_count']):
+        if offset + 6 > size:
+            break
+        ch, = struct.unpack_from('<H', packet, offset)
+        val, = struct.unpack_from('<f', packet, offset + 2)
+        parts.append(f'PAO ch={ch} val={val}')
+        offset += 6
+
+    for _ in range(hdr['dao_count']):
+        if offset + 6 > size:
+            break
+        ch, = struct.unpack_from('<H', packet, offset)
+        val, = struct.unpack_from('<f', packet, offset + 2)
+        parts.append(f'DAO ch={ch} val={val}')
+        offset += 6
+
+    parts.append(f'hex={packet.hex(" ")}')
+    return ', '.join(parts)
+
+
 class CSVtoPLCApp:
     def __init__(self, root):
         self.root = root
@@ -418,7 +485,7 @@ class CSVtoPLCApp:
     def _send_flag(self, send_sock, group, send_port, flag_bytes, label):
         """Send a start/end flag packet ($sN / $eN)."""
         send_sock.sendto(flag_bytes, (group, send_port))
-        self.log(f'  FLAG {label} -> {flag_bytes.decode("ascii")}')
+        self.log(f'  FLAG {label} -> {describe_flag_packet(flag_bytes)}')
 
     def _send_one_packet(self, send_sock, recv_sock, group, send_port, reply_enabled,
                          step_no, total_steps, label, channel, value, packet):
@@ -450,6 +517,7 @@ class CSVtoPLCApp:
             step_no = 0
 
             self.log(f'--- Starting send to {group}:{send_port} (RTU={RTU_NUMBER}) ---')
+            self.log(rtu_packet_format_summary())
             self.log('Order: COL1 then COL2 then COL3; flags are per column only ($s1/$e1 .. $s3/$e3)')
             self._log_csv_preview()
             self.log('PLC reply verification: disabled (fire-and-forget)')
@@ -468,11 +536,27 @@ class CSVtoPLCApp:
             for pass_no, (df_col, col_label) in enumerate(SEND_PASSES, start=1):
                 start_flag = column_flag('s', pass_no)
                 end_flag = column_flag('e', pass_no)
-                self.log(f'--- Pass {pass_no}: send {col_label} (all rows), wrapped by {start_flag.decode("ascii")} / {end_flag.decode("ascii")} ---')
+                self.log(
+                    f'--- Pass {pass_no}: send {col_label} ({total_rows} data packets), '
+                    f'flags {start_flag.decode("ascii")} / {end_flag.decode("ascii")} ---'
+                )
 
                 try:
                     advance()
                     self._send_flag(send_sock, group, send_port, start_flag, f'{col_label} start')
+
+                    sample_value = float(self.df.iloc[0, df_col])
+                    sample_packet = build_scada_packet(
+                        rtu_no=RTU_NUMBER,
+                        pdo_rows=[],
+                        ddo_rows=[],
+                        pao_rows=[(0, sample_value)],
+                        dao_rows=[],
+                    )
+                    self.log(
+                        f'  Data packet example ({col_label} row 1, val={sample_value}): '
+                        f'{describe_data_packet(sample_packet)}'
+                    )
 
                     for i, row in enumerate(self.df.itertuples(index=False), start=1):
                         value = float(row[df_col])
@@ -499,9 +583,13 @@ class CSVtoPLCApp:
                     tally('failed')
 
             data_packets = total_rows * len(SEND_PASSES)
+            flag_packets = total_steps - data_packets
+            sample_data = build_scada_packet(
+                rtu_no=RTU_NUMBER, pdo_rows=[], ddo_rows=[], pao_rows=[(0, 0.0)], dao_rows=[],
+            )
             self.log(
-                f'--- Column send summary: {data_packets} data packets '
-                f'(+ {total_steps - data_packets} flag packets) ---'
+                f'--- Column send summary: {data_packets} data packets @ {len(sample_data)}B each '
+                f'(RTU SCADA / PAO float32), {flag_packets} flag packets @ 3B each (ASCII) ---'
             )
             summary = f'Done: {total_steps} sent, {err_count} failed'
             self.log(f'--- {summary} ---')
