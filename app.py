@@ -14,6 +14,8 @@ RTU_SEND_PORT = 9001       # PLC sends from here (RTU -> SCADA)
 RTU_NUMBER = 1             # Must match the IF RTU_NO = 1 gate in PLC code
 REPLY_TIMEOUT_SEC = 0.5    # How long to wait for an RTU reply after each send
 HEADER_SIZE = 10           # RTU_NO + 4 x uint16 counts (little-endian)
+DATA_PACKET_SIZE = 16      # 10B header + 2B PAO ch + 4B PAO float32 (current encoding)
+FLAG_PACKET_SIZE = 3       # ASCII $sN / $eN
 
 
 def parse_rtu_header(data):
@@ -436,6 +438,39 @@ class CSVtoPLCApp:
             f'--- Send plan: send COL1 then COL2 then COL3 (each {n} packets), with only $s1/$e1..$s3/$e3 flags ---'
         )
 
+    def _log_byte_distribution(self, total_rows):
+        """Log byte breakdown in the on-screen log."""
+        data_packets = total_rows * len(SEND_PASSES)
+        flag_packets = len(SEND_PASSES) * 2
+        data_bytes = data_packets * DATA_PACKET_SIZE
+        flag_bytes = flag_packets * FLAG_PACKET_SIZE
+        total_bytes = data_bytes + flag_bytes
+        header_bytes = data_packets * HEADER_SIZE
+        pao_ch_bytes = data_packets * 2
+        pao_val_bytes = data_packets * 4
+        pass_data_bytes = total_rows * DATA_PACKET_SIZE
+        pass_flag_bytes = 2 * FLAG_PACKET_SIZE
+
+        def pct(part, whole):
+            return 0.0 if whole == 0 else 100.0 * part / whole
+
+        self.log('--- Byte distribution ---')
+        self.log(
+            f'Total payload: {total_bytes} B '
+            f'({data_packets} data @ {DATA_PACKET_SIZE}B + {flag_packets} flags @ {FLAG_PACKET_SIZE}B)'
+        )
+        self.log(
+            f'Data breakdown: header {header_bytes} B ({pct(header_bytes, data_bytes):.1f}%), '
+            f'PAO ch {pao_ch_bytes} B ({pct(pao_ch_bytes, data_bytes):.1f}%), '
+            f'PAO val {pao_val_bytes} B ({pct(pao_val_bytes, data_bytes):.1f}%)'
+        )
+        for col_label in ('COL1', 'COL2', 'COL3'):
+            pass_total = pass_data_bytes + pass_flag_bytes
+            self.log(
+                f'  {col_label}: {pass_total} B per pass '
+                f'({total_rows} data @ {DATA_PACKET_SIZE}B + 2 flags @ {FLAG_PACKET_SIZE}B)'
+            )
+
     def load_sample_data(self):
         try:
             df = pd.DataFrame(SAMPLE_CSV_ROWS)
@@ -584,13 +619,11 @@ class CSVtoPLCApp:
 
             data_packets = total_rows * len(SEND_PASSES)
             flag_packets = total_steps - data_packets
-            sample_data = build_scada_packet(
-                rtu_no=RTU_NUMBER, pdo_rows=[], ddo_rows=[], pao_rows=[(0, 0.0)], dao_rows=[],
-            )
             self.log(
-                f'--- Column send summary: {data_packets} data packets @ {len(sample_data)}B each '
-                f'(RTU SCADA / PAO float32), {flag_packets} flag packets @ 3B each (ASCII) ---'
+                f'--- Column send summary: {data_packets} data packets @ {DATA_PACKET_SIZE}B each '
+                f'(RTU SCADA / PAO float32), {flag_packets} flag packets @ {FLAG_PACKET_SIZE}B each (ASCII) ---'
             )
+            self._log_byte_distribution(total_rows)
             summary = f'Done: {total_steps} sent, {err_count} failed'
             self.log(f'--- {summary} ---')
 
