@@ -15,7 +15,7 @@ RTU_NUMBER = 1             # Must match the IF RTU_NO = 1 gate in PLC code
 REPLY_TIMEOUT_SEC = 0.5    # How long to wait for an RTU reply after each send
 HEADER_SIZE = 10           # RTU_NO + 4 x uint16 counts (little-endian)
 DATA_PACKET_SIZE = 16      # 10B header + 2B PAO ch + 4B PAO float32 (current encoding)
-FLAG_PACKET_SIZE = 3       # ASCII $sN / $eN
+ROUND_DELAY_SEC = 0.1      # Pause between complete send rounds
 
 
 def parse_rtu_header(data):
@@ -104,18 +104,43 @@ def build_scada_packet(rtu_no, pdo_rows, ddo_rows, pao_rows, dao_rows):
             + dao_ch + dao_val)
 
 
-def column_flag(prefix, index):
-    """Build a row flag like $s1 or $e2."""
-    return f'${prefix}{index}'.encode('ascii')
-
-
-# Each send pass on the mapped 3-column frame: (df_col_index, label)
-# NOTE: Per user requirement we treat all 3 columns as pure value streams (no channel logic).
+# Each send pass: (df_col_index, label, RTU block for that column's float/value)
 SEND_PASSES = (
-    (0, 'COL1'),
-    (1, 'COL2'),
-    (2, 'COL3'),
+    (0, 'COL1', 'pao'),
+    (1, 'COL2', 'pao'),
+    (2, 'COL3', 'dao'),
 )
+
+
+def row_address(row_index, col1_value):
+    """Use Column 1 as address when it is a positive integer channel, else row number."""
+    try:
+        ch = int(float(col1_value))
+        if ch > 0:
+            return ch
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return row_index
+
+
+def pass_channel(row_index, col1_value, col_label):
+    """Pick RTU channel/address so rows/columns don't all map to the same slot."""
+    addr = row_address(row_index, col1_value)
+    if col_label == 'COL1':
+        return row_index
+    return addr
+
+
+def build_pass_packet(channel, value, block):
+    """Build one RTU packet targeting a specific channel and block type."""
+    ch = int(channel)
+    if block == 'pao':
+        return build_scada_packet(RTU_NUMBER, [], [], [(ch, float(value))], [])
+    if block == 'dao':
+        return build_scada_packet(RTU_NUMBER, [], [], [], [(ch, float(value))])
+    if block == 'pdo':
+        return build_scada_packet(RTU_NUMBER, [(ch, int(value) & 0xFF)], [], [], [])
+    raise ValueError(f'Unknown block type: {block}')
 
 # In-memory test CSV — distinct values per column so logs are easy to trace
 SAMPLE_CSV_ROWS = (
@@ -143,12 +168,6 @@ def rtu_packet_format_summary():
         'PDO: ch uint16 + val uint8 each; DDO: ch uint16 + val uint8 each; '
         'PAO: ch uint16 + val float32 each; DAO: ch uint16 + val float32 each'
     )
-
-
-def describe_flag_packet(flag_bytes):
-    """Byte size and format for $sN / $eN flag packets."""
-    text = flag_bytes.decode('ascii')
-    return f'{len(flag_bytes)}B, format=ASCII flag "{text}"'
 
 
 def describe_data_packet(packet):
@@ -225,6 +244,7 @@ class CSVtoPLCApp:
         self.listen_port = tk.StringVar(value=str(RTU_SEND_PORT))
         self.status_text = tk.StringVar(value='Ready')
         self.is_sending = False
+        self.stop_sending = False
 
         self._build_ui()
 
@@ -262,9 +282,9 @@ class CSVtoPLCApp:
         data_frame.columnconfigure(1, weight=1)
 
         mapping_rows = (
-            ('Column 1 (sent first)', self.col1),
-            ('Column 2 (sent second)', self.col2),
-            ('Column 3 (sent third)', self.col3),
+            ('Column 1 — channel/address for COL2/COL3', self.col1),
+            ('Column 2 — PAO value at address', self.col2),
+            ('Column 3 — DAO value at address', self.col3),
         )
         self._col_combos = []
         for row_i, (label, var) in enumerate(mapping_rows):
@@ -435,40 +455,33 @@ class CSVtoPLCApp:
             )
         n = len(self.df)
         self.log(
-            f'--- Send plan: send COL1 then COL2 then COL3 (each {n} packets), with only $s1/$e1..$s3/$e3 flags ---'
+            f'--- Send plan: COL1→PAO(row#), COL2→PAO(address), COL3→DAO(address), '
+            f'{n} packets each, repeat every {ROUND_DELAY_SEC * 1000:.0f} ms ---'
         )
 
     def _log_byte_distribution(self, total_rows):
         """Log byte breakdown in the on-screen log."""
         data_packets = total_rows * len(SEND_PASSES)
-        flag_packets = len(SEND_PASSES) * 2
         data_bytes = data_packets * DATA_PACKET_SIZE
-        flag_bytes = flag_packets * FLAG_PACKET_SIZE
-        total_bytes = data_bytes + flag_bytes
         header_bytes = data_packets * HEADER_SIZE
         pao_ch_bytes = data_packets * 2
         pao_val_bytes = data_packets * 4
         pass_data_bytes = total_rows * DATA_PACKET_SIZE
-        pass_flag_bytes = 2 * FLAG_PACKET_SIZE
 
         def pct(part, whole):
             return 0.0 if whole == 0 else 100.0 * part / whole
 
         self.log('--- Byte distribution ---')
-        self.log(
-            f'Total payload: {total_bytes} B '
-            f'({data_packets} data @ {DATA_PACKET_SIZE}B + {flag_packets} flags @ {FLAG_PACKET_SIZE}B)'
-        )
+        self.log(f'Total payload: {data_bytes} B ({data_packets} data @ {DATA_PACKET_SIZE}B)')
         self.log(
             f'Data breakdown: header {header_bytes} B ({pct(header_bytes, data_bytes):.1f}%), '
             f'PAO ch {pao_ch_bytes} B ({pct(pao_ch_bytes, data_bytes):.1f}%), '
             f'PAO val {pao_val_bytes} B ({pct(pao_val_bytes, data_bytes):.1f}%)'
         )
         for col_label in ('COL1', 'COL2', 'COL3'):
-            pass_total = pass_data_bytes + pass_flag_bytes
             self.log(
-                f'  {col_label}: {pass_total} B per pass '
-                f'({total_rows} data @ {DATA_PACKET_SIZE}B + 2 flags @ {FLAG_PACKET_SIZE}B)'
+                f'  {col_label}: {pass_data_bytes} B per pass '
+                f'({total_rows} data @ {DATA_PACKET_SIZE}B)'
             )
 
     def load_sample_data(self):
@@ -504,6 +517,8 @@ class CSVtoPLCApp:
 
     def start_send(self):
         if self.is_sending:
+            self.stop_sending = True
+            self.set_status('Stopping after current round…', 'darkorange')
             return
         if self.raw_df is None:
             messagebox.showwarning('No file', 'Pick a CSV first.')
@@ -511,16 +526,11 @@ class CSVtoPLCApp:
         if not self._refresh_mapped_dataframe():
             messagebox.showwarning('Column mapping', self._column_mapping_error())
             return
-        # Run network work in a thread so UI stays responsive
         self.is_sending = True
-        self.send_btn.config(state='disabled', text='Sending...')
-        self.set_status('Sending…', 'blue')
+        self.stop_sending = False
+        self.send_btn.config(text='Stop', bg='#f44336')
+        self.set_status('Sending (loop)…', 'blue')
         threading.Thread(target=self._send_worker, daemon=True).start()
-
-    def _send_flag(self, send_sock, group, send_port, flag_bytes, label):
-        """Send a start/end flag packet ($sN / $eN)."""
-        send_sock.sendto(flag_bytes, (group, send_port))
-        self.log(f'  FLAG {label} -> {describe_flag_packet(flag_bytes)}')
 
     def _send_one_packet(self, send_sock, recv_sock, group, send_port, reply_enabled,
                          step_no, total_steps, label, channel, value, packet):
@@ -534,110 +544,107 @@ class CSVtoPLCApp:
 
     # ---------- Network (REWRITTEN FOR CODESYS RTU MULTICAST) ----------
 
+    def _send_one_round(self, send_sock, group, send_port, round_no, verbose=False):
+        """Send one full COL1 → COL2 → COL3 pass. Returns (err_count, total_steps)."""
+        total_rows = len(self.df)
+        total_steps = len(SEND_PASSES) * total_rows
+        self.progress['maximum'] = total_steps
+        self.progress['value'] = 0
+        err_count = 0
+        step_no = 0
+
+        self.log(f'--- Round {round_no} ---')
+
+        def tally(result):
+            nonlocal err_count
+            if result == 'failed':
+                err_count += 1
+
+        def advance():
+            nonlocal step_no
+            step_no += 1
+            self.progress['value'] = step_no
+            time.sleep(0.05)
+
+        for pass_no, (df_col, col_label, block) in enumerate(SEND_PASSES, start=1):
+            if self.stop_sending:
+                break
+            self.log(
+                f'--- Pass {pass_no}: send {col_label} via {block.upper()} '
+                f'({total_rows} data packets) ---'
+            )
+
+            try:
+                if verbose:
+                    sample_row = self.df.iloc[0]
+                    sample_ch = pass_channel(1, sample_row[0], col_label)
+                    sample_value = float(sample_row[df_col])
+                    sample_packet = build_pass_packet(sample_ch, sample_value, block)
+                    self.log(
+                        f'  Data packet example ({col_label} row 1, ch={sample_ch}, '
+                        f'val={sample_value}): {describe_data_packet(sample_packet)}'
+                    )
+
+                for i, row in enumerate(self.df.itertuples(index=False), start=1):
+                    if self.stop_sending:
+                        break
+                    channel = pass_channel(i, row[0], col_label)
+                    value = float(row[df_col])
+                    packet = build_pass_packet(channel, value, block)
+                    advance()
+                    result = self._send_one_packet(
+                        send_sock, None, group, send_port, False,
+                        step_no, total_steps,
+                        f'{col_label} row {i} ch={channel}', channel, value, packet,
+                    )
+                    tally(result)
+            except Exception as e:
+                self.log(f'[{step_no}/{total_steps}] FAILED pass {pass_no} {col_label}: {e}')
+                tally('failed')
+
+        self.log(f'--- Round {round_no} complete: {total_steps} packets, {err_count} failed ---')
+        return err_count, total_steps
+
     def _send_worker(self):
         send_sock = None
         try:
             group = self.plc_ip.get().strip()
             send_port = int(self.plc_port.get())
 
-            # --- Sender socket: UDP multicast ---
             send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
 
             total_rows = len(self.df)
-            # Per column pass: start flag + N packets + end flag
-            total_steps = len(SEND_PASSES) * (total_rows + 2)
-            self.progress['maximum'] = total_steps
-            err_count = 0
-            step_no = 0
-
-            self.log(f'--- Starting send to {group}:{send_port} (RTU={RTU_NUMBER}) ---')
+            self.log(f'--- Starting send loop to {group}:{send_port} (RTU={RTU_NUMBER}) ---')
             self.log(rtu_packet_format_summary())
-            self.log('Order: COL1 then COL2 then COL3; flags are per column only ($s1/$e1 .. $s3/$e3)')
+            self.log(
+                'Order: COL1 (PAO@row#) → COL2 (PAO@col1 address) → COL3 (DAO@col1 address)'
+            )
+            self.log(f'Loop: repeat full send every {ROUND_DELAY_SEC * 1000:.0f} ms (click Stop to end)')
             self._log_csv_preview()
             self.log('PLC reply verification: disabled (fire-and-forget)')
-
-            def tally(result):
-                nonlocal err_count
-                if result == 'failed':
-                    err_count += 1
-
-            def advance():
-                nonlocal step_no
-                step_no += 1
-                self.progress['value'] = step_no
-                time.sleep(0.05)
-
-            for pass_no, (df_col, col_label) in enumerate(SEND_PASSES, start=1):
-                start_flag = column_flag('s', pass_no)
-                end_flag = column_flag('e', pass_no)
-                self.log(
-                    f'--- Pass {pass_no}: send {col_label} ({total_rows} data packets), '
-                    f'flags {start_flag.decode("ascii")} / {end_flag.decode("ascii")} ---'
-                )
-
-                try:
-                    advance()
-                    self._send_flag(send_sock, group, send_port, start_flag, f'{col_label} start')
-
-                    sample_value = float(self.df.iloc[0, df_col])
-                    sample_packet = build_scada_packet(
-                        rtu_no=RTU_NUMBER,
-                        pdo_rows=[],
-                        ddo_rows=[],
-                        pao_rows=[(0, sample_value)],
-                        dao_rows=[],
-                    )
-                    self.log(
-                        f'  Data packet example ({col_label} row 1, val={sample_value}): '
-                        f'{describe_data_packet(sample_packet)}'
-                    )
-
-                    for i, row in enumerate(self.df.itertuples(index=False), start=1):
-                        value = float(row[df_col])
-                        # No channel logic: encode the value only. Channel is set to 0 (ignored by PLC side).
-                        packet = build_scada_packet(
-                            rtu_no=RTU_NUMBER,
-                            pdo_rows=[],
-                            ddo_rows=[],
-                            pao_rows=[(0, value)],
-                            dao_rows=[],
-                        )
-                        advance()
-                        result = self._send_one_packet(
-                            send_sock, None, group, send_port, False,
-                            step_no, total_steps,
-                            f'{col_label} row {i}', 0, value, packet,
-                        )
-                        tally(result)
-
-                    advance()
-                    self._send_flag(send_sock, group, send_port, end_flag, f'{col_label} end')
-                except Exception as e:
-                    self.log(f'[{step_no}/{total_steps}] FAILED pass {pass_no} {col_label}: {e}')
-                    tally('failed')
-
-            data_packets = total_rows * len(SEND_PASSES)
-            flag_packets = total_steps - data_packets
-            self.log(
-                f'--- Column send summary: {data_packets} data packets @ {DATA_PACKET_SIZE}B each '
-                f'(RTU SCADA / PAO float32), {flag_packets} flag packets @ {FLAG_PACKET_SIZE}B each (ASCII) ---'
-            )
             self._log_byte_distribution(total_rows)
-            summary = f'Done: {total_steps} sent, {err_count} failed'
-            self.log(f'--- {summary} ---')
 
-            color = 'red' if err_count else 'green'
-            self.set_status(summary, color)
-            if err_count:
-                self.root.after(
-                    0,
-                    lambda: messagebox.showwarning(
-                        'Send finished with issues',
-                        summary + '\n\n'
-                        'Failed = local error building or sending a packet.',
-                    ),
+            round_no = 0
+            total_err = 0
+            total_packets = 0
+
+            while not self.stop_sending:
+                round_no += 1
+                err_count, steps = self._send_one_round(
+                    send_sock, group, send_port, round_no, verbose=(round_no == 1),
                 )
+                total_err += err_count
+                total_packets += steps
+                if self.stop_sending:
+                    break
+                self.log(f'Waiting {ROUND_DELAY_SEC * 1000:.0f} ms before next round…')
+                time.sleep(ROUND_DELAY_SEC)
+
+            summary = f'Stopped: {round_no} round(s), {total_packets} packets, {total_err} failed'
+            self.log(f'--- {summary} ---')
+            color = 'red' if total_err else 'green'
+            self.set_status(summary, color)
 
         except Exception as e:
             self.log(f'FATAL: {e}')
@@ -647,7 +654,11 @@ class CSVtoPLCApp:
             if send_sock:
                 send_sock.close()
             self.is_sending = False
-            self.root.after(0, lambda: self.send_btn.config(state='normal', text='Send to PLC'))
+            self.stop_sending = False
+            self.root.after(
+                0,
+                lambda: self.send_btn.config(state='normal', text='Send to PLC', bg='#4CAF50'),
+            )
 
 
 if __name__ == '__main__':
