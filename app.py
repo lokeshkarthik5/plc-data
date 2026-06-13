@@ -15,24 +15,30 @@ REAL_SIZE = 4               # One float32 (real), little-endian
 ROUND_DELAY_SEC = 0.1       # Pause between complete send rounds
 
 
+NUM_COLUMNS = 3
+
+
 def build_column_batch(values):
-    """Pack all row values into one UDP payload: N × float32 LE, contiguous."""
+    """Pack float values into contiguous float32 LE bytes."""
     floats = [float(v) for v in values]
+    return struct.pack(f'<{len(floats)}f', *floats)
+
+
+def build_all_columns_batch(df):
+    """One UDP payload: COL1 all rows, then COL2, then COL3 (column-major)."""
+    floats = []
+    for col in range(NUM_COLUMNS):
+        floats.extend(float(v) for v in df.iloc[:, col])
     return struct.pack(f'<{len(floats)}f', *floats)
 
 
 def packet_format_summary():
     return (
-        'UDP payload: one packet per column, N×4B float32 (real) contiguous '
-        '(bytes 0-3=row1, 4-7=row2, …), little-endian'
+        'UDP payload: one packet with all 3 columns, column-major float32 LE — '
+        'COL1 rows, then COL2 rows, then COL3 rows (4B per REAL)'
     )
 
-# Each send pass: (df_col_index, label)
-SEND_PASSES = (
-    (0, 'COL1'),
-    (1, 'COL2'),
-    (2, 'COL3'),
-)
+COLUMN_LABELS = ('COL1', 'COL2', 'COL3')
 SAMPLE_CSV_ROWS = (
     {'Channel': 101, 'PAO': 1.11, 'DAO': 9.91},
     {'Channel': 102, 'PAO': 2.22, 'DAO': 8.82},
@@ -40,21 +46,33 @@ SAMPLE_CSV_ROWS = (
 )
 
 
-def describe_batched_packet(packet, max_preview=3):
-    """Byte size, value preview, and hex for a batched float32 column packet."""
+def describe_batched_packet(packet, n_rows=None, max_preview=3):
+    """Byte size, value preview, and hex for a batched float32 packet."""
     size = len(packet)
     if size == 0 or size % REAL_SIZE != 0:
         return f'{size}B, format=invalid (not a multiple of 4B), hex={packet.hex(" ")}'
     n = size // REAL_SIZE
     vals = struct.unpack(f'<{n}f', packet)
-    preview = ', '.join(str(v) for v in vals[:max_preview])
-    if n > max_preview:
-        preview += f', … ({n} reals total)'
+    if n_rows and n_rows * NUM_COLUMNS == n:
+        parts = []
+        for col_i, label in enumerate(COLUMN_LABELS):
+            start = col_i * n_rows
+            chunk = vals[start:start + n_rows]
+            preview = ', '.join(str(v) for v in chunk[:max_preview])
+            if n_rows > max_preview:
+                preview += f', … ({n_rows} total)'
+            parts.append(f'{label}[{start}..{start + n_rows - 1}]={preview}')
+        layout = '; '.join(parts)
+    else:
+        preview = ', '.join(str(v) for v in vals[:max_preview])
+        if n > max_preview:
+            preview += f', … ({n} reals total)'
+        layout = f'vals=[{preview}]'
     hex_len = min(16, size)
     hex_part = packet[:hex_len].hex(' ')
     if size > hex_len:
         hex_part += ' …'
-    return f'{size}B, format={n}×float32 LE, vals=[{preview}], hex={hex_part}'
+    return f'{size}B, format={n}×float32 LE, {layout}, hex={hex_part}'
 
 
 class CSVtoPLCApp:
@@ -290,27 +308,29 @@ class CSVtoPLCApp:
                 f'  row {i}: COL1={v1}, COL2={v2}, COL3={v3}'
             )
         n = len(self.df)
-        batch_bytes = n * REAL_SIZE
+        total_reals = n * NUM_COLUMNS
+        total_bytes = total_reals * REAL_SIZE
+        col_bytes = n * REAL_SIZE
         self.log(
-            f'--- Send plan: COL1 then COL2 then COL3, one batched UDP each '
-            f'({n} reals × 4B = {batch_bytes}B per column), '
+            f'--- Send plan: one UDP with all 3 columns ({total_reals} REALs = {total_bytes}B), '
+            f'COL1[{0}..{n - 1}] COL2[{n}..{2 * n - 1}] COL3[{2 * n}..{3 * n - 1}], '
             f'repeat every {ROUND_DELAY_SEC * 1000:.0f} ms ---'
         )
 
     def _log_byte_distribution(self, total_rows):
         """Log byte breakdown in the on-screen log."""
-        batch_bytes = total_rows * REAL_SIZE
-        round_bytes = batch_bytes * len(SEND_PASSES)
+        col_bytes = total_rows * REAL_SIZE
+        round_bytes = col_bytes * NUM_COLUMNS
 
         self.log('--- Byte distribution ---')
         self.log(
-            f'Total payload per round: {round_bytes} B '
-            f'({len(SEND_PASSES)} batched packets × {batch_bytes}B each)'
+            f'Total payload per round: {round_bytes} B (1 packet, {total_rows * NUM_COLUMNS} REALs)'
         )
-        for col_label in ('COL1', 'COL2', 'COL3'):
+        for col_i, col_label in enumerate(COLUMN_LABELS):
+            start = col_i * total_rows
             self.log(
-                f'  {col_label}: 1 packet, {batch_bytes} B '
-                f'({total_rows} reals × {REAL_SIZE}B, bytes 0-3=row1, 4-7=row2, …)'
+                f'  {col_label}: REAL index {start}..{start + total_rows - 1}, '
+                f'{col_bytes} B ({total_rows} × {REAL_SIZE}B)'
             )
 
     def load_sample_data(self):
@@ -373,55 +393,37 @@ class CSVtoPLCApp:
     # ---------- Network (REWRITTEN FOR CODESYS RTU MULTICAST) ----------
 
     def _send_one_round(self, send_sock, group, send_port, round_no, verbose=False):
-        """Send one full COL1 → COL2 → COL3 pass (one batched UDP per column)."""
+        """Send one UDP packet containing all 3 columns (column-major)."""
         total_rows = len(self.df)
-        total_steps = len(SEND_PASSES)
-        self.progress['maximum'] = total_steps
+        total_bytes = total_rows * NUM_COLUMNS * REAL_SIZE
+        self.progress['maximum'] = 1
         self.progress['value'] = 0
         err_count = 0
-        step_no = 0
 
-        self.log(f'--- Round {round_no} ---')
+        self.log(
+            f'--- Round {round_no}: send all columns in one batch '
+            f'({total_rows} rows × 3 cols = {total_rows * NUM_COLUMNS} REALs, {total_bytes}B) ---'
+        )
 
-        def tally(result):
-            nonlocal err_count
+        try:
+            packet = build_all_columns_batch(self.df)
+            if verbose:
+                self.log(f'  Batch preview: {describe_batched_packet(packet, total_rows)}')
+
+            self.progress['value'] = 1
+            result = self._send_one_packet(
+                send_sock, group, send_port,
+                1, 1,
+                f'all columns ({total_bytes}B)', packet,
+            )
             if result == 'failed':
                 err_count += 1
+        except Exception as e:
+            self.log(f'Round {round_no} FAILED: {e}')
+            err_count += 1
 
-        def advance():
-            nonlocal step_no
-            step_no += 1
-            self.progress['value'] = step_no
-
-        for pass_no, (df_col, col_label) in enumerate(SEND_PASSES, start=1):
-            if self.stop_sending:
-                break
-            batch_bytes = total_rows * REAL_SIZE
-            self.log(
-                f'--- Pass {pass_no}: send {col_label} as one batch '
-                f'({total_rows} reals, {batch_bytes}B) ---'
-            )
-
-            try:
-                values = [float(v) for v in self.df.iloc[:, df_col]]
-                packet = build_column_batch(values)
-                if verbose:
-                    self.log(f'  Batch preview: {describe_batched_packet(packet)}')
-
-                advance()
-                result = self._send_one_packet(
-                    send_sock, group, send_port,
-                    step_no, total_steps,
-                    f'{col_label} batch ({batch_bytes}B)', packet,
-                )
-                tally(result)
-                time.sleep(0.05)
-            except Exception as e:
-                self.log(f'[{step_no}/{total_steps}] FAILED pass {pass_no} {col_label}: {e}')
-                tally('failed')
-
-        self.log(f'--- Round {round_no} complete: {total_steps} batched packets, {err_count} failed ---')
-        return err_count, total_steps
+        self.log(f'--- Round {round_no} complete: 1 packet, {err_count} failed ---')
+        return err_count, 1
 
     def _send_worker(self):
         send_sock = None
@@ -435,7 +437,7 @@ class CSVtoPLCApp:
             total_rows = len(self.df)
             self.log(f'--- Starting send loop to {group}:{send_port} ---')
             self.log(packet_format_summary())
-            self.log('Order: COL1 → COL2 → COL3 (one batched UDP per column, N×4B contiguous)')
+            self.log('Order: one UDP — COL1 all rows, then COL2, then COL3 (column-major)')
             self.log(f'Loop: repeat full send every {ROUND_DELAY_SEC * 1000:.0f} ms (click Stop to end)')
             self._log_csv_preview()
             self.log('PLC reply verification: disabled (fire-and-forget)')
