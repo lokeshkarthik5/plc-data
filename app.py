@@ -16,12 +16,38 @@ ROUND_DELAY_SEC = 0.1       # Pause between complete send rounds
 
 
 NUM_COLUMNS = 3
+NUM_HEADER_PACKETS = 8
+
+# Tank list: RTU 4 = tanks 1–8, RTU 5 = tanks 9–12
+TANK_OPTIONS = (
+    {'tank': 1, 'rtu': 4, 'name': '1. FUEL OIL TANK 01'},
+    {'tank': 2, 'rtu': 4, 'name': '2. FUEL OIL TANK 02'},
+    {'tank': 3, 'rtu': 4, 'name': '3. FUEL OIL TANK 03'},
+    {'tank': 4, 'rtu': 4, 'name': '4. FO RU TANK 01'},
+    {'tank': 5, 'rtu': 4, 'name': '5. FO RU TANK 02'},
+    {'tank': 6, 'rtu': 4, 'name': '6. FO RU TANK 03'},
+    {'tank': 7, 'rtu': 4, 'name': '7. FO RU TANK 04'},
+    {'tank': 8, 'rtu': 4, 'name': '8. LO TANK'},
+    {'tank': 9, 'rtu': 5, 'name': '9. FRESH WATER TANK'},
+    {'tank': 10, 'rtu': 5, 'name': '10. GREY WATER TANK'},
+    {'tank': 11, 'rtu': 5, 'name': '11. BILGE OIL TANK'},
+    {'tank': 12, 'rtu': 5, 'name': '12. DIRTY OIL TANK'},
+)
+
+# Remaining header REALs (after RTU_Number and Tank_Number)
+FRAME_HEADER_FIELDS = (
+    ('column_size', 'Column_Size', ''),
+    ('sensor_min_bar', 'Sensor_Min_bar', '0'),
+    ('sensor_max_bar', 'Sensor_Max_bar', '0'),
+    ('density', 'Density', '0'),
+    ('dead_volume', 'Dead_Volume', '0'),
+    ('tank_height', 'Tank_Height', '0'),
+)
 
 
-def build_column_batch(values):
-    """Pack float values into contiguous float32 LE bytes."""
-    floats = [float(v) for v in values]
-    return struct.pack(f'<{len(floats)}f', *floats)
+def build_float_packet(value):
+    """Build a single 4-byte float32 LE UDP payload."""
+    return struct.pack('<f', float(value))
 
 
 def build_all_columns_batch(df):
@@ -34,8 +60,8 @@ def build_all_columns_batch(df):
 
 def packet_format_summary():
     return (
-        'UDP payload: one packet with all 3 columns, column-major float32 LE — '
-        'COL1 rows, then COL2 rows, then COL3 rows (4B per REAL)'
+        'UDP: 8 header REALs (one 4B packet each), then one batched packet with '
+        'all 3 columns column-major float32 LE'
     )
 
 COLUMN_LABELS = ('COL1', 'COL2', 'COL3')
@@ -79,7 +105,7 @@ class CSVtoPLCApp:
     def __init__(self, root):
         self.root = root
         self.root.title('CSV to PLC')
-        self.root.geometry('700x750')
+        self.root.geometry('700x900')
 
         # Retina/HiDPI scaling fix for Mac
         try:
@@ -96,6 +122,9 @@ class CSVtoPLCApp:
         self.plc_ip = tk.StringVar(value=MULTICAST_GROUP)
         self.plc_port = tk.StringVar(value=str(RTU_LISTEN_PORT))
         self.listen_port = tk.StringVar(value=str(RTU_SEND_PORT))
+        self.tank_selection = tk.StringVar(value=TANK_OPTIONS[0]['name'])
+        self.rtu_number = tk.StringVar(value=str(TANK_OPTIONS[0]['rtu']))
+        self.header_vars = {key: tk.StringVar(value=default) for key, _, default in FRAME_HEADER_FIELDS}
         self.status_text = tk.StringVar(value='Ready')
         self.is_sending = False
         self.stop_sending = False
@@ -117,6 +146,47 @@ class CSVtoPLCApp:
 
         ttk.Label(conn_frame, text='Listen Port:').grid(row=1, column=0, sticky='e', padx=5, pady=5)
         ttk.Entry(conn_frame, textvariable=self.listen_port, width=8).grid(row=1, column=1, sticky='w', padx=5)
+
+        # --- Tank details ---
+        header_frame = ttk.LabelFrame(self.root, text='Tank details')
+        header_frame.pack(fill='x', **pad)
+        header_frame.columnconfigure(1, weight=1)
+        header_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(header_frame, text='Tank:').grid(
+            row=0, column=0, sticky='e', padx=(10, 5), pady=3,
+        )
+        tank_combo = ttk.Combobox(
+            header_frame,
+            textvariable=self.tank_selection,
+            values=[t['name'] for t in TANK_OPTIONS],
+            state='readonly',
+            width=28,
+        )
+        tank_combo.grid(row=0, column=1, sticky='ew', padx=(0, 10), pady=3)
+        tank_combo.bind('<<ComboboxSelected>>', self._on_tank_selected)
+
+        ttk.Label(header_frame, text='RTU_Number:').grid(
+            row=0, column=2, sticky='e', padx=(10, 5), pady=3,
+        )
+        rtu_entry = ttk.Entry(header_frame, textvariable=self.rtu_number, width=8, state='readonly')
+        rtu_entry.grid(row=0, column=3, sticky='w', padx=(0, 10), pady=3)
+
+        for i, (key, label, _default) in enumerate(FRAME_HEADER_FIELDS):
+            row, col = divmod(i, 2)
+            base_col = col * 2
+            ttk.Label(header_frame, text=label + ':').grid(
+                row=row + 1, column=base_col, sticky='e', padx=(10, 5), pady=3,
+            )
+            ttk.Entry(header_frame, textvariable=self.header_vars[key], width=14).grid(
+                row=row + 1, column=base_col + 1, sticky='ew', padx=(0, 10), pady=3,
+            )
+
+        ttk.Label(
+            header_frame,
+            text='Column_Size defaults to row count if left empty.',
+            foreground='gray',
+        ).grid(row=4, column=0, columnspan=4, sticky='w', padx=10, pady=(0, 6))
 
         # --- File selection ---
         file_frame = ttk.LabelFrame(self.root, text='CSV File')
@@ -163,7 +233,7 @@ class CSVtoPLCApp:
         log_frame = ttk.LabelFrame(self.root, text='Log')
         log_frame.pack(fill='both', expand=True, **pad)
 
-        self.log_box = tk.Text(log_frame, height=16, wrap='word')
+        self.log_box = tk.Text(log_frame, height=12, wrap='word')
         scrollbar = ttk.Scrollbar(log_frame, command=self.log_box.yview)
         self.log_box.configure(yscrollcommand=scrollbar.set)
         self.log_box.pack(side='left', fill='both', expand=True, padx=(5, 0), pady=5)
@@ -297,6 +367,41 @@ class CSVtoPLCApp:
         if self._refresh_mapped_dataframe(log=True):
             self.set_status('Column mapping updated', 'blue')
 
+    def _selected_tank(self):
+        name = self.tank_selection.get()
+        for tank in TANK_OPTIONS:
+            if tank['name'] == name:
+                return tank
+        return TANK_OPTIONS[0]
+
+    def _on_tank_selected(self, _event=None):
+        tank = self._selected_tank()
+        self.rtu_number.set(str(tank['rtu']))
+
+    def _header_values(self):
+        """Read and validate the 8 frame header REALs. Column_Size defaults to row count."""
+        if self.df is None:
+            raise ValueError('No mapped data loaded.')
+        tank = self._selected_tank()
+        values = [
+            ('RTU_Number', float(tank['rtu'])),
+            ('Tank_Number', float(tank['tank'])),
+        ]
+        for key, label, _ in FRAME_HEADER_FIELDS:
+            raw = self.header_vars[key].get().strip()
+            if key == 'column_size' and not raw:
+                raw = str(len(self.df))
+            try:
+                values.append((label, float(raw)))
+            except ValueError:
+                raise ValueError(f'{label} must be a number.')
+        return values
+
+    def _log_header_preview(self):
+        self.log('--- Frame header (8 packets × 4B, sent first) ---')
+        for label, value in self._header_values():
+            self.log(f'  {label} = {value}')
+
     def _log_csv_preview(self):
         """Log every row’s mapped 3-column values."""
         if self.df is None:
@@ -312,25 +417,30 @@ class CSVtoPLCApp:
         total_bytes = total_reals * REAL_SIZE
         col_bytes = n * REAL_SIZE
         self.log(
-            f'--- Send plan: one UDP with all 3 columns ({total_reals} REALs = {total_bytes}B), '
-            f'COL1[{0}..{n - 1}] COL2[{n}..{2 * n - 1}] COL3[{2 * n}..{3 * n - 1}], '
+            f'--- Send plan: 8 header packets (4B each), then 1 data packet '
+            f'({total_reals} REALs = {total_bytes}B), '
             f'repeat every {ROUND_DELAY_SEC * 1000:.0f} ms ---'
         )
 
     def _log_byte_distribution(self, total_rows):
         """Log byte breakdown in the on-screen log."""
+        header_bytes = NUM_HEADER_PACKETS * REAL_SIZE
         col_bytes = total_rows * REAL_SIZE
-        round_bytes = col_bytes * NUM_COLUMNS
+        data_bytes = col_bytes * NUM_COLUMNS
+        round_bytes = header_bytes + data_bytes
 
         self.log('--- Byte distribution ---')
         self.log(
-            f'Total payload per round: {round_bytes} B (1 packet, {total_rows * NUM_COLUMNS} REALs)'
+            f'Total payload per round: {round_bytes} B '
+            f'({NUM_HEADER_PACKETS} header × {REAL_SIZE}B + 1 data × {data_bytes}B)'
         )
+        self.log(f'  Header: {NUM_HEADER_PACKETS} packets × {REAL_SIZE}B = {header_bytes}B')
+        self.log(f'  Data: 1 packet × {data_bytes}B ({total_rows * NUM_COLUMNS} REALs)')
         for col_i, col_label in enumerate(COLUMN_LABELS):
             start = col_i * total_rows
             self.log(
-                f'  {col_label}: REAL index {start}..{start + total_rows - 1}, '
-                f'{col_bytes} B ({total_rows} × {REAL_SIZE}B)'
+                f'    {col_label}: REAL index {start}..{start + total_rows - 1}, '
+                f'{col_bytes} B'
             )
 
     def load_sample_data(self):
@@ -375,6 +485,11 @@ class CSVtoPLCApp:
         if not self._refresh_mapped_dataframe():
             messagebox.showwarning('Column mapping', self._column_mapping_error())
             return
+        try:
+            self._header_values()
+        except ValueError as e:
+            messagebox.showwarning('Tank details', str(e))
+            return
         self.is_sending = True
         self.stop_sending = False
         self.send_btn.config(text='Stop', bg='#f44336')
@@ -393,37 +508,65 @@ class CSVtoPLCApp:
     # ---------- Network (REWRITTEN FOR CODESYS RTU MULTICAST) ----------
 
     def _send_one_round(self, send_sock, group, send_port, round_no, verbose=False):
-        """Send one UDP packet containing all 3 columns (column-major)."""
+        """Send 8 header REALs (one packet each), then all column data in one batch."""
         total_rows = len(self.df)
-        total_bytes = total_rows * NUM_COLUMNS * REAL_SIZE
-        self.progress['maximum'] = 1
+        data_bytes = total_rows * NUM_COLUMNS * REAL_SIZE
+        total_steps = NUM_HEADER_PACKETS + 1
+        self.progress['maximum'] = total_steps
         self.progress['value'] = 0
         err_count = 0
+        step_no = 0
 
-        self.log(
-            f'--- Round {round_no}: send all columns in one batch '
-            f'({total_rows} rows × 3 cols = {total_rows * NUM_COLUMNS} REALs, {total_bytes}B) ---'
-        )
+        self.log(f'--- Round {round_no} ---')
 
         try:
-            packet = build_all_columns_batch(self.df)
+            header_items = self._header_values()
             if verbose:
-                self.log(f'  Batch preview: {describe_batched_packet(packet, total_rows)}')
+                self._log_header_preview()
 
-            self.progress['value'] = 1
-            result = self._send_one_packet(
-                send_sock, group, send_port,
-                1, 1,
-                f'all columns ({total_bytes}B)', packet,
-            )
-            if result == 'failed':
-                err_count += 1
+            for label, value in header_items:
+                if self.stop_sending:
+                    break
+                step_no += 1
+                self.progress['value'] = step_no
+                packet = build_float_packet(value)
+                if verbose:
+                    val, = struct.unpack('<f', packet)
+                    self.log(f'  Header packet {step_no}/{NUM_HEADER_PACKETS}: {label}={val} (4B)')
+                result = self._send_one_packet(
+                    send_sock, group, send_port,
+                    step_no, total_steps,
+                    f'header {label}={value}', packet,
+                )
+                if result == 'failed':
+                    err_count += 1
+                time.sleep(0.05)
+
+            if not self.stop_sending:
+                step_no += 1
+                self.progress['value'] = step_no
+                packet = build_all_columns_batch(self.df)
+                if verbose:
+                    self.log(
+                        f'  Data packet ({data_bytes}B): '
+                        f'{describe_batched_packet(packet, total_rows)}'
+                    )
+                result = self._send_one_packet(
+                    send_sock, group, send_port,
+                    step_no, total_steps,
+                    f'data batch ({data_bytes}B)', packet,
+                )
+                if result == 'failed':
+                    err_count += 1
         except Exception as e:
             self.log(f'Round {round_no} FAILED: {e}')
             err_count += 1
 
-        self.log(f'--- Round {round_no} complete: 1 packet, {err_count} failed ---')
-        return err_count, 1
+        self.log(
+            f'--- Round {round_no} complete: {total_steps} packets '
+            f'({NUM_HEADER_PACKETS} header + 1 data), {err_count} failed ---'
+        )
+        return err_count, total_steps
 
     def _send_worker(self):
         send_sock = None
@@ -437,8 +580,9 @@ class CSVtoPLCApp:
             total_rows = len(self.df)
             self.log(f'--- Starting send loop to {group}:{send_port} ---')
             self.log(packet_format_summary())
-            self.log('Order: one UDP — COL1 all rows, then COL2, then COL3 (column-major)')
+            self.log('Order: 8 header REALs (4B each) → 1 data packet (all columns)')
             self.log(f'Loop: repeat full send every {ROUND_DELAY_SEC * 1000:.0f} ms (click Stop to end)')
+            self._log_header_preview()
             self._log_csv_preview()
             self.log('PLC reply verification: disabled (fire-and-forget)')
             self._log_byte_distribution(total_rows)
