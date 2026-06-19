@@ -13,10 +13,12 @@ RTU_LISTEN_PORT = 4001     # PLC listen port (SCADA -> RTU)
 RTU_SEND_PORT = 9001      # PLC send port (RTU -> SCADA)
 REAL_SIZE = 4               # One float32 (real), little-endian
 ROUND_DELAY_SEC = 0.1       # Pause between complete send rounds
-HEADER_PACKET_DELAY_SEC = 0.05  # Pause between tank-detail packets
 
 NUM_COLUMNS = 3
-NUM_HEADER_PACKETS = 8
+NUM_HEADER_REALS = 8        # RTU_Number, Tank_Number + 6 FRAME_HEADER_FIELDS
+
+# Soft cap inferred from PLC ARRAY[0..1360] OF REAL (1361 REALs). Used only for a warning.
+PLC_BUFFER_REALS = 1361
 
 # Tank list: RTU 4 = tanks 1–8, RTU 5 = tanks 9–12
 TANK_OPTIONS = (
@@ -45,14 +47,23 @@ FRAME_HEADER_FIELDS = (
 )
 
 
-def build_float_packet(value):
-    """Build a single 4-byte float32 LE UDP payload."""
-    return struct.pack('<f', float(value))
+def build_combined_packet(header_values, df):
+    """One UDP payload: 8 header REALs first, then CSV column-major.
 
-
-def build_all_columns_batch(df):
-    """One UDP payload: COL1 all rows, then COL2, then COL3 (column-major)."""
-    floats = []
+    Layout (float32 LE):
+        [0]                RTU_Number
+        [1]                Tank_Number
+        [2]                Column_Size
+        [3]                Sensor_Min_bar
+        [4]                Sensor_Max_bar
+        [5]                Density
+        [6]                Dead_Volume
+        [7]                Tank_Height
+        [8 .. 8+N-1]       COL1 (all rows)
+        [8+N .. 8+2N-1]    COL2 (all rows)
+        [8+2N .. 8+3N-1]   COL3 (all rows)
+    """
+    floats = [float(value) for _label, value in header_values]
     for col in range(NUM_COLUMNS):
         floats.extend(float(v) for v in df.iloc[:, col])
     return struct.pack(f'<{len(floats)}f', *floats)
@@ -60,8 +71,8 @@ def build_all_columns_batch(df):
 
 def packet_format_summary():
     return (
-        'UDP: 8 tank-detail packets (4B each), then one batched CSV packet '
-        '(column-major float32 LE)'
+        'UDP: ONE combined packet — 8 header REALs (indices 0–7) followed by '
+        'CSV data (column-major float32 LE)'
     )
 
 COLUMN_LABELS = ('COL1', 'COL2', 'COL3')
@@ -72,28 +83,25 @@ SAMPLE_CSV_ROWS = (
 )
 
 
-def describe_batched_packet(packet, n_rows=None, max_preview=3):
-    """Byte size, value preview, and hex for a batched float32 packet."""
+def describe_combined_packet(packet, n_rows=None, max_preview=3):
+    """Byte size, value preview, and hex for a combined header+CSV float32 packet."""
     size = len(packet)
     if size == 0 or size % REAL_SIZE != 0:
         return f'{size}B, format=invalid (not a multiple of 4B), hex={packet.hex(" ")}'
     n = size // REAL_SIZE
     vals = struct.unpack(f'<{n}f', packet)
-    if n_rows and n_rows * NUM_COLUMNS == n:
-        parts = []
+    parts = []
+    header = vals[:NUM_HEADER_REALS]
+    parts.append('header[0..7]=' + ', '.join(str(v) for v in header))
+    if n_rows is not None and NUM_HEADER_REALS + n_rows * NUM_COLUMNS == n:
         for col_i, label in enumerate(COLUMN_LABELS):
-            start = col_i * n_rows
+            start = NUM_HEADER_REALS + col_i * n_rows
             chunk = vals[start:start + n_rows]
             preview = ', '.join(str(v) for v in chunk[:max_preview])
             if n_rows > max_preview:
                 preview += f', … ({n_rows} total)'
             parts.append(f'{label}[{start}..{start + n_rows - 1}]={preview}')
-        layout = '; '.join(parts)
-    else:
-        preview = ', '.join(str(v) for v in vals[:max_preview])
-        if n > max_preview:
-            preview += f', … ({n} reals total)'
-        layout = f'vals=[{preview}]'
+    layout = '; '.join(parts)
     hex_len = min(16, size)
     hex_part = packet[:hex_len].hex(' ')
     if size > hex_len:
@@ -398,9 +406,9 @@ class CSVtoPLCApp:
         return values
 
     def _log_header_preview(self):
-        self.log('--- Tank details (8 packets × 4B, sent first) ---')
-        for label, value in self._header_values():
-            self.log(f'  {label} = {value}')
+        self.log('--- Tank details (header REALs, indices 0..7, in combined packet) ---')
+        for i, (label, value) in enumerate(self._header_values()):
+            self.log(f'  [{i}] {label} = {value}')
 
     def _log_csv_preview(self):
         """Log every row’s mapped 3-column values."""
@@ -413,33 +421,39 @@ class CSVtoPLCApp:
                 f'  row {i}: COL1={v1}, COL2={v2}, COL3={v3}'
             )
         n = len(self.df)
-        total_reals = n * NUM_COLUMNS
+        total_reals = NUM_HEADER_REALS + n * NUM_COLUMNS
         total_bytes = total_reals * REAL_SIZE
         self.log(
-            f'--- Send plan: {NUM_HEADER_PACKETS} tank packets (4B each), '
-            f'then 1 CSV packet ({total_reals} REALs = {total_bytes}B), '
+            f'--- Send plan: 1 combined packet '
+            f'({NUM_HEADER_REALS} header + {n * NUM_COLUMNS} CSV = {total_reals} REALs = {total_bytes}B), '
             f'repeat every {ROUND_DELAY_SEC * 1000:.0f} ms ---'
         )
+        if total_reals > PLC_BUFFER_REALS:
+            self.log(
+                f'WARNING: {total_reals} REALs exceeds PLC buffer of {PLC_BUFFER_REALS} '
+                f'(ARRAY[0..{PLC_BUFFER_REALS - 1}]). Reduce rows or enlarge the PLC array.'
+            )
 
     def _log_byte_distribution(self, total_rows):
-        """Log byte breakdown in the on-screen log."""
-        header_bytes = NUM_HEADER_PACKETS * REAL_SIZE
+        """Log byte/index breakdown for the single combined packet."""
+        header_bytes = NUM_HEADER_REALS * REAL_SIZE
         col_bytes = total_rows * REAL_SIZE
         data_bytes = col_bytes * NUM_COLUMNS
-        round_bytes = header_bytes + data_bytes
+        packet_bytes = header_bytes + data_bytes
 
-        self.log('--- Byte distribution ---')
+        self.log('--- Byte / index distribution (single combined packet) ---')
         self.log(
-            f'Total payload per round: {round_bytes} B '
-            f'({NUM_HEADER_PACKETS} tank × {REAL_SIZE}B + 1 CSV × {data_bytes}B)'
+            f'Total payload per round: {packet_bytes} B '
+            f'({NUM_HEADER_REALS} header REALs + {total_rows * NUM_COLUMNS} CSV REALs)'
         )
-        self.log(f'  Tank details: {NUM_HEADER_PACKETS} packets × {REAL_SIZE}B = {header_bytes}B')
-        self.log(f'  CSV data: 1 packet × {data_bytes}B ({total_rows * NUM_COLUMNS} REALs)')
+        self.log(f'  Header: REAL index 0..{NUM_HEADER_REALS - 1} ({header_bytes}B)')
+        for i, (label, _value) in enumerate(self._header_values()):
+            self.log(f'    [{i}] {label}')
         for col_i, col_label in enumerate(COLUMN_LABELS):
-            start = col_i * total_rows
+            start = NUM_HEADER_REALS + col_i * total_rows
+            end = start + total_rows - 1
             self.log(
-                f'    {col_label}: REAL index {start}..{start + total_rows - 1}, '
-                f'{col_bytes} B'
+                f'  {col_label}: REAL index {start}..{end}, {col_bytes} B'
             )
 
     def load_sample_data(self):
@@ -504,68 +518,46 @@ class CSVtoPLCApp:
             self.log(f'[{step_no}/{total_steps}] FAILED {label}: {e}')
             return 'failed'
 
-    def _send_tank_packet(self, send_sock, group, send_port, step_no, total_steps, label, value):
-        """Send one tank-detail value as its own 4B UDP packet."""
-        packet = build_float_packet(value)
-        if len(packet) != REAL_SIZE:
-            self.log(
-                f'[{step_no}/{total_steps}] FAILED {label}: '
-                f'expected {REAL_SIZE}B, got {len(packet)}B'
-            )
-            return 'failed'
-        return self._send_one_packet(
-            send_sock, group, send_port,
-            step_no, total_steps,
-            f'tank {label}={value} ({REAL_SIZE}B)', packet,
-        )
-
-    # ---------- Network (REWRITTEN FOR CODESYS RTU MULTICAST) ----------
+    # ---------- Network (CODESYS RTU MULTICAST — single combined packet) ----------
 
     def _send_one_round(self, send_sock, group, send_port, round_no):
-        """Send 8 tank-detail packets (4B each), then one batched CSV packet."""
+        """Send ONE combined UDP packet: 8 header REALs, then CSV column-major."""
         total_rows = len(self.df)
-        total_steps = NUM_HEADER_PACKETS + 1
+        total_steps = 1
         self.progress['maximum'] = total_steps
         self.progress['value'] = 0
         err_count = 0
-        step_no = 0
 
         self.log(f'--- Round {round_no} ---')
 
         try:
             header_items = self._header_values()
+            packet = build_combined_packet(header_items, self.df)
 
-            for label, value in header_items:
-                if self.stop_sending:
-                    break
-                step_no += 1
-                self.progress['value'] = step_no
-                result = self._send_tank_packet(
-                    send_sock, group, send_port,
-                    step_no, total_steps, label, value,
+            expected_reals = NUM_HEADER_REALS + total_rows * NUM_COLUMNS
+            expected_bytes = expected_reals * REAL_SIZE
+            if len(packet) != expected_bytes:
+                self.log(
+                    f'[1/1] WARNING: packet is {len(packet)}B, expected {expected_bytes}B'
                 )
-                if result == 'failed':
-                    err_count += 1
-                time.sleep(HEADER_PACKET_DELAY_SEC)
 
-            if not self.stop_sending:
-                step_no += 1
-                self.progress['value'] = step_no
-                packet = build_all_columns_batch(self.df)
-                result = self._send_one_packet(
-                    send_sock, group, send_port,
-                    step_no, total_steps,
-                    f'CSV batch ({total_rows * NUM_COLUMNS * REAL_SIZE}B)', packet,
-                )
-                if result == 'failed':
-                    err_count += 1
+            self.progress['value'] = 1
+            result = self._send_one_packet(
+                send_sock, group, send_port,
+                1, total_steps,
+                f'combined ({NUM_HEADER_REALS} header + {total_rows * NUM_COLUMNS} CSV '
+                f'= {expected_reals} REALs, {len(packet)}B)',
+                packet,
+            )
+            if result == 'failed':
+                err_count += 1
         except Exception as e:
             self.log(f'Round {round_no} FAILED: {e}')
             err_count += 1
 
         self.log(
-            f'--- Round {round_no} complete: {total_steps} packets '
-            f'({NUM_HEADER_PACKETS} tank × {REAL_SIZE}B + 1 CSV), {err_count} failed ---'
+            f'--- Round {round_no} complete: 1 combined packet '
+            f'({NUM_HEADER_REALS} header + {total_rows * NUM_COLUMNS} CSV REALs), {err_count} failed ---'
         )
         return err_count, total_steps
 
@@ -581,7 +573,11 @@ class CSVtoPLCApp:
             total_rows = len(self.df)
             self.log(f'--- Starting send loop to {group}:{send_port} ---')
             self.log(packet_format_summary())
-            self.log('Order: 8 tank packets (4B each) → 1 CSV batch packet')
+            self.log(
+                'Order (single packet): [RTU_Number, Tank_Number, Column_Size, '
+                'Sensor_Min_bar, Sensor_Max_bar, Density, Dead_Volume, Tank_Height, '
+                'COL1…, COL2…, COL3…]'
+            )
             self.log(f'Loop: repeat full send every {ROUND_DELAY_SEC * 1000:.0f} ms (click Stop to end)')
             self._log_header_preview()
             self._log_csv_preview()
