@@ -22,18 +22,18 @@ PLC_BUFFER_REALS = 1361
 
 # Tank list: RTU 4 = tanks 1–8, RTU 5 = tanks 9–12
 TANK_OPTIONS = (
-    {'tank': 1, 'rtu': 4, 'name': '1. FUEL OIL TANK 01'},
-    {'tank': 2, 'rtu': 4, 'name': '2. FUEL OIL TANK 02'},
-    {'tank': 3, 'rtu': 4, 'name': '3. FUEL OIL TANK 03'},
-    {'tank': 4, 'rtu': 4, 'name': '4. FO RU TANK 01'},
-    {'tank': 5, 'rtu': 4, 'name': '5. FO RU TANK 02'},
-    {'tank': 6, 'rtu': 4, 'name': '6. FO RU TANK 03'},
-    {'tank': 7, 'rtu': 4, 'name': '7. FO RU TANK 04'},
-    {'tank': 8, 'rtu': 4, 'name': '8. LO TANK'},
-    {'tank': 9, 'rtu': 5, 'name': '9. FRESH WATER TANK'},
-    {'tank': 10, 'rtu': 5, 'name': '10. GREY WATER TANK'},
-    {'tank': 11, 'rtu': 5, 'name': '11. BILGE OIL TANK'},
-    {'tank': 12, 'rtu': 5, 'name': '12. DIRTY OIL TANK'},
+    {'tank': 1, 'rtu': 4.0, 'name': '1. FUEL OIL TANK 01'},
+    {'tank': 2, 'rtu': 4.0, 'name': '2. FUEL OIL TANK 02'},
+    {'tank': 3, 'rtu': 4.0, 'name': '3. FUEL OIL TANK 03'},
+    {'tank': 4, 'rtu': 4.0, 'name': '4. FO RU TANK 01'},
+    {'tank': 5, 'rtu': 4.0, 'name': '5. FO RU TANK 02'},
+    {'tank': 6, 'rtu': 4.0, 'name': '6. FO RU TANK 03'},
+    {'tank': 7, 'rtu': 4.0, 'name': '7. FO RU TANK 04'},
+    {'tank': 8, 'rtu': 4.0, 'name': '8. LO TANK'},
+    {'tank': 9, 'rtu': 5.0, 'name': '9. FRESH WATER TANK'},
+    {'tank': 10, 'rtu': 5.0, 'name': '10. GREY WATER TANK'},
+    {'tank': 11, 'rtu': 5.0, 'name': '11. BILGE OIL TANK'},
+    {'tank': 12, 'rtu': 5.0, 'name': '12. DIRTY OIL TANK'},
 )
 
 # Remaining header REALs (after RTU_Number and Tank_Number)
@@ -392,7 +392,7 @@ class CSVtoPLCApp:
             raise ValueError('No mapped data loaded.')
         tank = self._selected_tank()
         values = [
-            ('RTU_Number', float(tank['rtu'])),
+            ('RTU_Number', tank['rtu']),
             ('Tank_Number', float(tank['tank'])),
         ]
         for key, label, _ in FRAME_HEADER_FIELDS:
