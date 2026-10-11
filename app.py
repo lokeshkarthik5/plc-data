@@ -6,7 +6,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import pandas as pd
 
-from tankgauge.calibration import Mode, calibrate, clean_table, load_points_csv
+from tankgauge.calibration import Mode, calibrate, clean_table, load_points_csv, preview_reading
 from tankgauge.packet import (
     COLUMN_LABELS,
     NUM_COLUMNS,
@@ -90,6 +90,7 @@ class CSVtoPLCApp:
         self.cal_file_text = tk.StringVar(value='No calibration file')
         self.cal_mode = tk.StringVar(value='Offset (recommended)')
         self.cal_status_text = tk.StringVar(value='Load a sounding table CSV')
+        self.check_mA = tk.StringVar(value='4.5')
 
         self._build_ui()
         self._apply_tank_preset()
@@ -216,6 +217,13 @@ class CSVtoPLCApp:
         )
         self.cal_status_label = ttk.Label(cal_frame, textvariable=self.cal_status_text, foreground='gray')
         self.cal_status_label.grid(row=2, column=0, columnspan=3, sticky='w', padx=10, pady=(0, 6))
+
+        check_frame = ttk.Frame(cal_frame)
+        check_frame.grid(row=3, column=0, columnspan=3, sticky='w', padx=10, pady=(0, 6))
+        ttk.Label(check_frame, text='Check reading at').pack(side='left')
+        ttk.Entry(check_frame, textvariable=self.check_mA, width=8).pack(side='left', padx=5)
+        ttk.Label(check_frame, text='mA').pack(side='left')
+        ttk.Button(check_frame, text='Check', command=self.check_reading).pack(side='left', padx=(10, 0))
 
         # --- Log ---
         log_frame = ttk.LabelFrame(self.root, text='Log')
@@ -580,6 +588,42 @@ class CSVtoPLCApp:
         for e in result.errors:
             self.log(f'  ERROR: {e}')
         self.log(f'--- {self.cal_status_text.get()} ---')
+
+    def check_reading(self):
+        """Log what the PLC should show for an mA value, using the table selected for sending."""
+        try:
+            mA = float(self.check_mA.get().strip())
+        except ValueError:
+            messagebox.showwarning('Check reading', 'mA must be a number.')
+            return
+        self._recalibrate()
+        if self.send_df is None:
+            self.log(f'Check reading: {self.cal_status_text.get()}')
+            return
+        try:
+            header = dict(self._header_values(self.send_df))
+        except ValueError as e:
+            messagebox.showwarning('Tank details', str(e))
+            return
+        source = 'sample data' if self.is_sample else self.cal_mode.get()
+        r = preview_reading(mA, header, self.send_df['COL1'].tolist(), self.send_df['COL2'].tolist())
+        if r['status'] == 'SENSOR_FAULT':
+            self.log(f'Check {mA:g} mA [{source}]: SENSOR_FAULT (outside 3.8–20.5 mA, NAMUR NE43)')
+        else:
+            self.log(
+                f'Check {mA:g} mA [{source}]: {r["status"]} · P {r["pressure_bar"]:.6f} bar · '
+                f'L {r["level_m"]:.6f} m ({r["level_pct"] or 0:.1f}%) · '
+                f'V {r["volume_m3"]:.6f} m³ = {r["litres"]:.1f} L ({r["volume_pct"] or 0:.1f}%) · '
+                f'{r["tonnes"]:.4f} t'
+            )
+        if self.cal_result is not None and self.cal_result.errors:
+            self.log('  Note: this table has calibration errors and would not be sent.')
+        base_at_zero = clean_table(self.df['COL1'].tolist(), self.df['COL2'].tolist(), None)[1][0]
+        self.log(
+            f'  Dead_Volume = {header["Dead_Volume"]:g} m³ (sent separately, not included above). '
+            f'PLC may add Dead_Volume; base table already reads {base_at_zero:g} m³ at 0 m — '
+            f'check for double counting.'
+        )
 
     def _confirm_calibration(self):
         """Errors block sending; warnings need confirmation. Returns True to proceed."""
