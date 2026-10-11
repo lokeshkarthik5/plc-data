@@ -1,24 +1,26 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 import socket
-import struct
 import threading
 import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
 import pandas as pd
 
+from tankgauge.packet import (
+    COLUMN_LABELS,
+    NUM_COLUMNS,
+    NUM_HEADER_REALS,
+    PLC_BUFFER_REALS,
+    REAL_SIZE,
+    build_combined_packet,
+    packet_format_summary,
+)
 
 # ---- UDP multicast defaults ----
 MULTICAST_GROUP = '239.255.43.21'
 RTU_LISTEN_PORT = 4001     # PLC listen port (SCADA -> RTU)
 RTU_SEND_PORT = 9001      # PLC send port (RTU -> SCADA)
-REAL_SIZE = 4               # One float32 (real), little-endian
 ROUND_DELAY_SEC = 0.1       # Pause between complete send rounds
-
-NUM_COLUMNS = 3
-NUM_HEADER_REALS = 8        # RTU_Number, Tank_Number + 6 FRAME_HEADER_FIELDS
-
-# Soft cap inferred from PLC ARRAY[0..1360] OF REAL (1361 REALs). Used only for a warning.
-PLC_BUFFER_REALS = 1361
 
 # Tank list: RTU 4 = tanks 1–8, RTU 5 = tanks 9–12
 TANK_OPTIONS = (
@@ -46,67 +48,11 @@ FRAME_HEADER_FIELDS = (
     ('tank_height', 'Tank_Height', '0'),
 )
 
-
-def build_combined_packet(header_values, df):
-    """One UDP payload: 8 header REALs first, then CSV column-major.
-
-    Layout (float32 LE):
-        [0]                RTU_Number
-        [1]                Tank_Number
-        [2]                Column_Size
-        [3]                Sensor_Min_bar
-        [4]                Sensor_Max_bar
-        [5]                Density
-        [6]                Dead_Volume
-        [7]                Tank_Height
-        [8 .. 8+N-1]       COL1 (all rows)
-        [8+N .. 8+2N-1]    COL2 (all rows)
-        [8+2N .. 8+3N-1]   COL3 (all rows)
-    """
-    floats = [float(value) for _label, value in header_values]
-    for col in range(NUM_COLUMNS):
-        floats.extend(float(v) for v in df.iloc[:, col])
-    return struct.pack(f'<{len(floats)}f', *floats)
-
-
-def packet_format_summary():
-    return (
-        'UDP: ONE combined packet — 8 header REALs (indices 0–7) followed by '
-        'CSV data (column-major float32 LE)'
-    )
-
-COLUMN_LABELS = ('COL1', 'COL2', 'COL3')
 SAMPLE_CSV_ROWS = (
     {'Channel': 101, 'PAO': 1.11, 'DAO': 9.91},
     {'Channel': 102, 'PAO': 2.22, 'DAO': 8.82},
     {'Channel': 103, 'PAO': 3.33, 'DAO': 7.73},
 )
-
-
-def describe_combined_packet(packet, n_rows=None, max_preview=3):
-    """Byte size, value preview, and hex for a combined header+CSV float32 packet."""
-    size = len(packet)
-    if size == 0 or size % REAL_SIZE != 0:
-        return f'{size}B, format=invalid (not a multiple of 4B), hex={packet.hex(" ")}'
-    n = size // REAL_SIZE
-    vals = struct.unpack(f'<{n}f', packet)
-    parts = []
-    header = vals[:NUM_HEADER_REALS]
-    parts.append('header[0..7]=' + ', '.join(str(v) for v in header))
-    if n_rows is not None and NUM_HEADER_REALS + n_rows * NUM_COLUMNS == n:
-        for col_i, label in enumerate(COLUMN_LABELS):
-            start = NUM_HEADER_REALS + col_i * n_rows
-            chunk = vals[start:start + n_rows]
-            preview = ', '.join(str(v) for v in chunk[:max_preview])
-            if n_rows > max_preview:
-                preview += f', … ({n_rows} total)'
-            parts.append(f'{label}[{start}..{start + n_rows - 1}]={preview}')
-    layout = '; '.join(parts)
-    hex_len = min(16, size)
-    hex_part = packet[:hex_len].hex(' ')
-    if size > hex_len:
-        hex_part += ' …'
-    return f'{size}B, format={n}×float32 LE, {layout}, hex={hex_part}'
 
 
 class CSVtoPLCApp:
@@ -296,7 +242,7 @@ class CSVtoPLCApp:
     def _populate_column_selectors(self):
         names = self._column_display_names()
         defaults = names[:3]
-        for combo, var, default in zip(self._col_combos, (self.col1, self.col2, self.col3), defaults):
+        for combo, var, default in zip(self._col_combos, (self.col1, self.col2, self.col3), defaults, strict=False):
             combo['values'] = names
             combo.configure(state='readonly')
             var.set(default)
@@ -402,7 +348,7 @@ class CSVtoPLCApp:
             try:
                 values.append((label, float(raw)))
             except ValueError:
-                raise ValueError(f'{label} must be a number.')
+                raise ValueError(f'{label} must be a number.') from None
         return values
 
     def _log_header_preview(self):
@@ -606,9 +552,10 @@ class CSVtoPLCApp:
             self.set_status(summary, color)
 
         except Exception as e:
-            self.log(f'FATAL: {e}')
-            self.set_status(f'Failed: {e}', 'red')
-            self.root.after(0, lambda: messagebox.showerror('Send failed', str(e)))
+            msg = str(e)
+            self.log(f'FATAL: {msg}')
+            self.set_status(f'Failed: {msg}', 'red')
+            self.root.after(0, lambda: messagebox.showerror('Send failed', msg))
         finally:
             if send_sock:
                 send_sock.close()
