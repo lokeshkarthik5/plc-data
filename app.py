@@ -1,39 +1,32 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 import socket
-import struct
 import threading
 import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
 import pandas as pd
 
+from tankgauge.calibration import Mode, calibrate, clean_table, load_points_csv, preview_reading
+from tankgauge.packet import (
+    COLUMN_LABELS,
+    NUM_COLUMNS,
+    NUM_HEADER_REALS,
+    PLC_BUFFER_REALS,
+    REAL_SIZE,
+    build_combined_packet,
+    packet_format_summary,
+)
+from tankgauge.tanks import TANKS, preset_header_fields
 
 # ---- UDP multicast defaults ----
 MULTICAST_GROUP = '239.255.43.21'
 RTU_LISTEN_PORT = 4001     # PLC listen port (SCADA -> RTU)
 RTU_SEND_PORT = 9001      # PLC send port (RTU -> SCADA)
-REAL_SIZE = 4               # One float32 (real), little-endian
 ROUND_DELAY_SEC = 0.1       # Pause between complete send rounds
 
-NUM_COLUMNS = 3
-NUM_HEADER_REALS = 8        # RTU_Number, Tank_Number + 6 FRAME_HEADER_FIELDS
-
-# Soft cap inferred from PLC ARRAY[0..1360] OF REAL (1361 REALs). Used only for a warning.
-PLC_BUFFER_REALS = 1361
-
-# Tank list: RTU 4 = tanks 1–8, RTU 5 = tanks 9–12
-TANK_OPTIONS = (
-    {'tank': 1, 'rtu': 4.0, 'name': '1. FUEL OIL TANK 01'},
-    {'tank': 2, 'rtu': 4.0, 'name': '2. FUEL OIL TANK 02'},
-    {'tank': 3, 'rtu': 4.0, 'name': '3. FUEL OIL TANK 03'},
-    {'tank': 4, 'rtu': 4.0, 'name': '4. FO RU TANK 01'},
-    {'tank': 5, 'rtu': 4.0, 'name': '5. FO RU TANK 02'},
-    {'tank': 6, 'rtu': 4.0, 'name': '6. FO RU TANK 03'},
-    {'tank': 7, 'rtu': 4.0, 'name': '7. FO RU TANK 04'},
-    {'tank': 8, 'rtu': 4.0, 'name': '8. LO TANK'},
-    {'tank': 9, 'rtu': 5.0, 'name': '9. FRESH WATER TANK'},
-    {'tank': 10, 'rtu': 5.0, 'name': '10. GREY WATER TANK'},
-    {'tank': 11, 'rtu': 5.0, 'name': '11. BILGE OIL TANK'},
-    {'tank': 12, 'rtu': 5.0, 'name': '12. DIRTY OIL TANK'},
+# Tank list: RTU 4 = tanks 1–8, RTU 5 = tanks 9–12 (see tankgauge.tanks)
+TANK_OPTIONS = tuple(
+    {'tank': t.number, 'rtu': t.rtu, 'name': t.label, 'preset': t} for t in TANKS
 )
 
 # Remaining header REALs (after RTU_Number and Tank_Number)
@@ -46,67 +39,18 @@ FRAME_HEADER_FIELDS = (
     ('tank_height', 'Tank_Height', '0'),
 )
 
-
-def build_combined_packet(header_values, df):
-    """One UDP payload: 8 header REALs first, then CSV column-major.
-
-    Layout (float32 LE):
-        [0]                RTU_Number
-        [1]                Tank_Number
-        [2]                Column_Size
-        [3]                Sensor_Min_bar
-        [4]                Sensor_Max_bar
-        [5]                Density
-        [6]                Dead_Volume
-        [7]                Tank_Height
-        [8 .. 8+N-1]       COL1 (all rows)
-        [8+N .. 8+2N-1]    COL2 (all rows)
-        [8+2N .. 8+3N-1]   COL3 (all rows)
-    """
-    floats = [float(value) for _label, value in header_values]
-    for col in range(NUM_COLUMNS):
-        floats.extend(float(v) for v in df.iloc[:, col])
-    return struct.pack(f'<{len(floats)}f', *floats)
-
-
-def packet_format_summary():
-    return (
-        'UDP: ONE combined packet — 8 header REALs (indices 0–7) followed by '
-        'CSV data (column-major float32 LE)'
-    )
-
-COLUMN_LABELS = ('COL1', 'COL2', 'COL3')
 SAMPLE_CSV_ROWS = (
     {'Channel': 101, 'PAO': 1.11, 'DAO': 9.91},
     {'Channel': 102, 'PAO': 2.22, 'DAO': 8.82},
     {'Channel': 103, 'PAO': 3.33, 'DAO': 7.73},
 )
 
-
-def describe_combined_packet(packet, n_rows=None, max_preview=3):
-    """Byte size, value preview, and hex for a combined header+CSV float32 packet."""
-    size = len(packet)
-    if size == 0 or size % REAL_SIZE != 0:
-        return f'{size}B, format=invalid (not a multiple of 4B), hex={packet.hex(" ")}'
-    n = size // REAL_SIZE
-    vals = struct.unpack(f'<{n}f', packet)
-    parts = []
-    header = vals[:NUM_HEADER_REALS]
-    parts.append('header[0..7]=' + ', '.join(str(v) for v in header))
-    if n_rows is not None and NUM_HEADER_REALS + n_rows * NUM_COLUMNS == n:
-        for col_i, label in enumerate(COLUMN_LABELS):
-            start = NUM_HEADER_REALS + col_i * n_rows
-            chunk = vals[start:start + n_rows]
-            preview = ', '.join(str(v) for v in chunk[:max_preview])
-            if n_rows > max_preview:
-                preview += f', … ({n_rows} total)'
-            parts.append(f'{label}[{start}..{start + n_rows - 1}]={preview}')
-    layout = '; '.join(parts)
-    hex_len = min(16, size)
-    hex_part = packet[:hex_len].hex(' ')
-    if size > hex_len:
-        hex_part += ' …'
-    return f'{size}B, format={n}×float32 LE, {layout}, hex={hex_part}'
+CAL_MODE_LABELS = {
+    'None': Mode.NONE,
+    'Offset (recommended)': Mode.OFFSET,
+    'Direct': Mode.DIRECT,
+}
+MAX_LISTED_ISSUES = 10
 
 
 class CSVtoPLCApp:
@@ -136,8 +80,22 @@ class CSVtoPLCApp:
         self.status_text = tk.StringVar(value='Ready')
         self.is_sending = False
         self.stop_sending = False
+        self.is_sample = False
+        self.cal_points = None
+        self.cal_filename = None
+        self.cal_result = None
+        self.send_df = None
+        self.sending_df = None
+        self.sending_label = ''
+        self.cal_file_text = tk.StringVar(value='No calibration file')
+        self.cal_mode = tk.StringVar(value='Offset (recommended)')
+        self.cal_status_text = tk.StringVar(value='Load a sounding table CSV')
+        self.check_mA = tk.StringVar(value='4.5')
 
         self._build_ui()
+        self._apply_tank_preset()
+        for key in ('density', 'tank_height'):
+            self.header_vars[key].trace_add('write', lambda *_: self._recalibrate())
 
     def _build_ui(self):
         pad = {'padx': 10, 'pady': 5}
@@ -237,6 +195,36 @@ class CSVtoPLCApp:
         )
         self.mapping_hint.grid(row=3, column=0, columnspan=2, sticky='w', padx=10, pady=(0, 6))
 
+        # --- Calibration ---
+        cal_frame = ttk.LabelFrame(self.root, text='Calibration')
+        cal_frame.pack(fill='x', **pad)
+        cal_frame.columnconfigure(1, weight=1)
+
+        ttk.Button(cal_frame, text='Load calibration CSV…', command=self.pick_calibration_file).grid(
+            row=0, column=0, sticky='w', padx=(10, 5), pady=4,
+        )
+        ttk.Label(cal_frame, textvariable=self.cal_file_text, foreground='blue').grid(
+            row=0, column=1, columnspan=2, sticky='w', padx=(0, 10), pady=4,
+        )
+        ttk.Label(cal_frame, text='Mode:').grid(row=1, column=0, sticky='e', padx=(10, 5), pady=4)
+        mode_combo = ttk.Combobox(
+            cal_frame, textvariable=self.cal_mode, values=list(CAL_MODE_LABELS), state='readonly', width=22,
+        )
+        mode_combo.grid(row=1, column=1, sticky='w', padx=(0, 10), pady=4)
+        mode_combo.bind('<<ComboboxSelected>>', lambda _e: self._recalibrate(log=True))
+        ttk.Button(cal_frame, text='Show comparison', command=self.show_comparison).grid(
+            row=1, column=2, sticky='e', padx=(0, 10), pady=4,
+        )
+        self.cal_status_label = ttk.Label(cal_frame, textvariable=self.cal_status_text, foreground='gray')
+        self.cal_status_label.grid(row=2, column=0, columnspan=3, sticky='w', padx=10, pady=(0, 6))
+
+        check_frame = ttk.Frame(cal_frame)
+        check_frame.grid(row=3, column=0, columnspan=3, sticky='w', padx=10, pady=(0, 6))
+        ttk.Label(check_frame, text='Check reading at').pack(side='left')
+        ttk.Entry(check_frame, textvariable=self.check_mA, width=8).pack(side='left', padx=5)
+        ttk.Label(check_frame, text='mA').pack(side='left')
+        ttk.Button(check_frame, text='Check', command=self.check_reading).pack(side='left', padx=(10, 0))
+
         # --- Log ---
         log_frame = ttk.LabelFrame(self.root, text='Log')
         log_frame.pack(fill='both', expand=True, **pad)
@@ -271,10 +259,11 @@ class CSVtoPLCApp:
 
     # ---------- CSV load & column mapping ----------
 
-    def _load_dataframe(self, df, source_label):
+    def _load_dataframe(self, df, source_label, is_sample=False):
         """Store full CSV, populate column selectors, build mapped send frame."""
         if df.shape[1] < 3:
             raise ValueError(f'CSV needs at least 3 columns, found {df.shape[1]}')
+        self.is_sample = is_sample
         self.raw_df = df.reset_index(drop=True)
         self.filepath.set(source_label)
         self.log(f'Loaded {len(self.raw_df)} rows, {self.raw_df.shape[1]} columns from {source_label}')
@@ -296,7 +285,7 @@ class CSVtoPLCApp:
     def _populate_column_selectors(self):
         names = self._column_display_names()
         defaults = names[:3]
-        for combo, var, default in zip(self._col_combos, (self.col1, self.col2, self.col3), defaults):
+        for combo, var, default in zip(self._col_combos, (self.col1, self.col2, self.col3), defaults, strict=False):
             combo['values'] = names
             combo.configure(state='readonly')
             var.set(default)
@@ -334,6 +323,7 @@ class CSVtoPLCApp:
         err = self._column_mapping_error()
         if err:
             self.df = None
+            self._recalibrate()
             if log:
                 self.log(f'Column mapping: {err}')
             return False
@@ -356,6 +346,7 @@ class CSVtoPLCApp:
         numeric['COL3'] = numeric['COL3'].astype(float)
 
         self.df = numeric
+        self._recalibrate(log=log)
         if log:
             self.log(f'Mapping: [{c1}] → Column 1 | [{c2}] → Column 2 | [{c3}] → Column 3')
             if dropped:
@@ -383,12 +374,22 @@ class CSVtoPLCApp:
         return TANK_OPTIONS[0]
 
     def _on_tank_selected(self, _event=None):
+        self._apply_tank_preset()
+        tank = self._selected_tank()
+        self.log(f'Tank preset applied: {tank["name"]} (header fields remain editable)')
+
+    def _apply_tank_preset(self):
+        """Fill RTU and header fields from the selected tank's preset."""
         tank = self._selected_tank()
         self.rtu_number.set(str(tank['rtu']))
+        for key, value in preset_header_fields(tank['preset']).items():
+            self.header_vars[key].set(f'{value:g}')
 
-    def _header_values(self):
-        """Read and validate the 8 frame header REALs. Column_Size defaults to row count."""
-        if self.df is None:
+    def _header_values(self, table=None):
+        """Read and validate the 8 frame header REALs. Column_Size defaults to the sent table's row count."""
+        if table is None:
+            table = self.send_df if self.send_df is not None else self.df
+        if table is None:
             raise ValueError('No mapped data loaded.')
         tank = self._selected_tank()
         values = [
@@ -398,29 +399,31 @@ class CSVtoPLCApp:
         for key, label, _ in FRAME_HEADER_FIELDS:
             raw = self.header_vars[key].get().strip()
             if key == 'column_size' and not raw:
-                raw = str(len(self.df))
+                raw = str(len(table))
             try:
                 values.append((label, float(raw)))
             except ValueError:
-                raise ValueError(f'{label} must be a number.')
+                raise ValueError(f'{label} must be a number.') from None
         return values
 
     def _log_header_preview(self):
         self.log('--- Tank details (header REALs, indices 0..7, in combined packet) ---')
-        for i, (label, value) in enumerate(self._header_values()):
+        for i, (label, value) in enumerate(self._header_values(self.sending_df)):
             self.log(f'  [{i}] {label} = {value}')
 
-    def _log_csv_preview(self):
-        """Log every row’s mapped 3-column values."""
-        if self.df is None:
+    def _log_csv_preview(self, df=None, title='Mapped data preview'):
+        """Log every row’s 3-column values (mapped CSV by default)."""
+        if df is None:
+            df = self.df
+        if df is None:
             return
-        self.log('--- Mapped data preview ---')
-        for i, row in enumerate(self.df.itertuples(index=False), start=1):
+        self.log(f'--- {title} ---')
+        for i, row in enumerate(df.itertuples(index=False), start=1):
             v1, v2, v3 = float(row[0]), float(row[1]), float(row[2])
             self.log(
                 f'  row {i}: COL1={v1}, COL2={v2}, COL3={v3}'
             )
-        n = len(self.df)
+        n = len(df)
         total_reals = NUM_HEADER_REALS + n * NUM_COLUMNS
         total_bytes = total_reals * REAL_SIZE
         self.log(
@@ -447,7 +450,7 @@ class CSVtoPLCApp:
             f'({NUM_HEADER_REALS} header REALs + {total_rows * NUM_COLUMNS} CSV REALs)'
         )
         self.log(f'  Header: REAL index 0..{NUM_HEADER_REALS - 1} ({header_bytes}B)')
-        for i, (label, _value) in enumerate(self._header_values()):
+        for i, (label, _value) in enumerate(self._header_values(self.sending_df)):
             self.log(f'    [{i}] {label}')
         for col_i, col_label in enumerate(COLUMN_LABELS):
             start = NUM_HEADER_REALS + col_i * total_rows
@@ -459,7 +462,7 @@ class CSVtoPLCApp:
     def load_sample_data(self):
         try:
             df = pd.DataFrame(SAMPLE_CSV_ROWS)
-            self._load_dataframe(df, 'sample_data (in-memory)')
+            self._load_dataframe(df, 'sample_data (in-memory)', is_sample=True)
             self.log('Tip: use Load sample data + Send to PLC to verify all 3 columns in the log.')
         except Exception as e:
             messagebox.showerror('Error loading sample data', str(e))
@@ -475,6 +478,181 @@ class CSVtoPLCApp:
             self._load_dataframe(pd.read_csv(path), path.split('/')[-1])
         except Exception as e:
             messagebox.showerror('Error reading CSV', str(e))
+
+    # ---------- Calibration ----------
+
+    def pick_calibration_file(self):
+        path = filedialog.askopenfilename(
+            title='Choose calibration CSV (level, volume)',
+            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')]
+        )
+        if not path:
+            return
+        try:
+            points = load_points_csv(path)
+        except Exception as e:
+            messagebox.showerror('Error reading calibration CSV', str(e))
+            return
+        self.cal_points = points
+        self.cal_filename = path.split('/')[-1]
+        self.cal_file_text.set(f'{self.cal_filename} ({len(points)} points)')
+        self.log(f'Loaded {len(points)} calibration points from {self.cal_filename}')
+        self._recalibrate(log=True)
+
+    def _selected_mode(self):
+        return CAL_MODE_LABELS.get(self.cal_mode.get(), Mode.NONE)
+
+    def _header_float(self, key):
+        try:
+            return float(self.header_vars[key].get().strip())
+        except ValueError:
+            return None
+
+    def _set_cal_status(self, text, color):
+        self.cal_status_text.set(text)
+        self.cal_status_label.configure(foreground=color)
+
+    def _recalibrate(self, log=False):
+        """Rebuild the table to send from the mapped CSV, calibration points, mode and Density."""
+        self.cal_result = None
+        self.send_df = None
+        if self.df is None:
+            self._set_cal_status('Load a sounding table CSV', 'gray')
+            return
+        if self.is_sample:
+            self.send_df = self.df
+            self._set_cal_status('Sample data — not a sounding table, sent as loaded (no calibration)', 'gray')
+            return
+        mode = self._selected_mode()
+        density = self._header_float('density')
+        if density is None or density <= 0:
+            self._set_cal_status('Density must be a positive number to calibrate', 'red')
+            return
+        if mode is not Mode.NONE and not self.cal_points:
+            self._set_cal_status('Load a calibration CSV, or choose mode None', 'red')
+            return
+
+        result = calibrate(
+            self.df['COL1'].tolist(), self.df['COL2'].tolist(), self.df['COL3'].tolist(),
+            self.cal_points or [], mode, density, tank_height=self._header_float('tank_height'),
+        )
+        self.cal_result = result
+        if result.levels:
+            self.send_df = pd.DataFrame({'COL1': result.levels, 'COL2': result.volumes, 'COL3': result.weights})
+
+        what = 'Calibrated' if mode is not Mode.NONE else 'Base table (no calibration)'
+        color = 'red' if result.errors else 'darkorange' if result.warnings else 'green'
+        self._set_cal_status(
+            f'{what} {len(result.levels)} rows · {len(result.warnings)} warnings · {len(result.errors)} errors',
+            color,
+        )
+        if log:
+            self.log(f'Calibration: {self.cal_status_text.get()}')
+
+    def show_comparison(self):
+        self._recalibrate()
+        result = self.cal_result
+        if result is None:
+            self.log(f'Comparison: {self.cal_status_text.get()}')
+            return
+        mode = self._selected_mode()
+        self.log(f'--- Calibration comparison: mode {self.cal_mode.get()}, file {self.cal_filename or "none"} ---')
+        base_levels, base_volumes, _, _ = clean_table(
+            self.df['COL1'].tolist(), self.df['COL2'].tolist(), None,
+        )
+        if mode is not Mode.NONE and result.levels:
+            base_at = dict(zip(base_levels, base_volumes, strict=True))
+            cal_at = dict(zip(result.levels, result.volumes, strict=True))
+            self.log('  Level m | Corrected | Base V | Calibrated V | Δ (cal − base)')
+            for p in self.cal_points:
+                if p.level not in base_at:
+                    self.log(f'  {p.level:7.3f} | {p.volume:9.3f} | (not on base grid)')
+                    continue
+                base_v, cal_v = base_at[p.level], cal_at[p.level]
+                self.log(
+                    f'  {p.level:7.3f} | {p.volume:9.3f} | {base_v:6.3f} | {cal_v:12.3f} | {cal_v - base_v:+.3f}'
+                )
+            self.log('  Cross-section per calibration segment (ΔV/ΔL):')
+            for p1, p2 in zip(self.cal_points, self.cal_points[1:], strict=False):
+                if p1.level not in base_at or p2.level not in base_at:
+                    continue
+                span = p2.level - p1.level
+                base_slope = (base_at[p2.level] - base_at[p1.level]) / span
+                cal_slope = (cal_at[p2.level] - cal_at[p1.level]) / span
+                pct = f'{(cal_slope - base_slope) / base_slope * 100:+.0f}%' if base_slope else 'n/a'
+                self.log(
+                    f'  {p1.level:.2f}–{p2.level:.2f} m: {cal_slope:.2f} m³/m vs base {base_slope:.2f} ({pct})'
+                )
+        for w in result.warnings:
+            self.log(f'  WARNING: {w}')
+        for e in result.errors:
+            self.log(f'  ERROR: {e}')
+        self.log(f'--- {self.cal_status_text.get()} ---')
+
+    def check_reading(self):
+        """Log what the PLC should show for an mA value, using the table selected for sending."""
+        try:
+            mA = float(self.check_mA.get().strip())
+        except ValueError:
+            messagebox.showwarning('Check reading', 'mA must be a number.')
+            return
+        self._recalibrate()
+        if self.send_df is None:
+            self.log(f'Check reading: {self.cal_status_text.get()}')
+            return
+        try:
+            header = dict(self._header_values(self.send_df))
+        except ValueError as e:
+            messagebox.showwarning('Tank details', str(e))
+            return
+        source = 'sample data' if self.is_sample else self.cal_mode.get()
+        r = preview_reading(mA, header, self.send_df['COL1'].tolist(), self.send_df['COL2'].tolist())
+        if r['status'] == 'SENSOR_FAULT':
+            self.log(f'Check {mA:g} mA [{source}]: SENSOR_FAULT (outside 3.8–20.5 mA, NAMUR NE43)')
+        else:
+            self.log(
+                f'Check {mA:g} mA [{source}]: {r["status"]} · P {r["pressure_bar"]:.6f} bar · '
+                f'L {r["level_m"]:.6f} m ({r["level_pct"] or 0:.1f}%) · '
+                f'V {r["volume_m3"]:.6f} m³ = {r["litres"]:.1f} L ({r["volume_pct"] or 0:.1f}%) · '
+                f'{r["tonnes"]:.4f} t'
+            )
+        if self.cal_result is not None and self.cal_result.errors:
+            self.log('  Note: this table has calibration errors and would not be sent.')
+        base_at_zero = clean_table(self.df['COL1'].tolist(), self.df['COL2'].tolist(), None)[1][0]
+        self.log(
+            f'  Dead_Volume = {header["Dead_Volume"]:g} m³ (sent separately, not included above). '
+            f'PLC may add Dead_Volume; base table already reads {base_at_zero:g} m³ at 0 m — '
+            f'check for double counting.'
+        )
+
+    def _confirm_calibration(self):
+        """Errors block sending; warnings need confirmation. Returns True to proceed."""
+        self._recalibrate()
+        if self.is_sample:
+            return True
+        result = self.cal_result
+        if result is None:
+            messagebox.showerror('Calibration', self.cal_status_text.get())
+            return False
+        if result.errors:
+            messagebox.showerror('Calibration errors — not sending', _format_issues(result.errors))
+            return False
+        warnings = list(result.warnings)
+        column_size = self.header_vars['column_size'].get().strip()
+        if column_size:
+            try:
+                if float(column_size) != len(self.send_df):
+                    warnings.insert(
+                        0, f'Column_Size field is {column_size} but the table to send has {len(self.send_df)} rows.',
+                    )
+            except ValueError:
+                pass
+        if warnings:
+            return messagebox.askyesno(
+                'Calibration warnings',
+                _format_issues(warnings) + '\n\nSend anyway?',
+            )
+        return True
 
     def log(self, msg):
         self.log_box.insert(tk.END, msg + '\n')
@@ -503,6 +681,13 @@ class CSVtoPLCApp:
         except ValueError as e:
             messagebox.showwarning('Tank details', str(e))
             return
+        if not self._confirm_calibration():
+            return
+        self.sending_df = self.send_df
+        self.sending_label = (
+            'sample data (no calibration)' if self.is_sample
+            else f'mode {self.cal_mode.get()}, calibration file {self.cal_filename or "none"}'
+        )
         self.is_sending = True
         self.stop_sending = False
         self.send_btn.config(text='Stop', bg='#f44336')
@@ -522,7 +707,7 @@ class CSVtoPLCApp:
 
     def _send_one_round(self, send_sock, group, send_port, round_no):
         """Send ONE combined UDP packet: 8 header REALs, then CSV column-major."""
-        total_rows = len(self.df)
+        total_rows = len(self.sending_df)
         total_steps = 1
         self.progress['maximum'] = total_steps
         self.progress['value'] = 0
@@ -531,8 +716,8 @@ class CSVtoPLCApp:
         self.log(f'--- Round {round_no} ---')
 
         try:
-            header_items = self._header_values()
-            packet = build_combined_packet(header_items, self.df)
+            header_items = self._header_values(self.sending_df)
+            packet = build_combined_packet(header_items, self.sending_df)
 
             expected_reals = NUM_HEADER_REALS + total_rows * NUM_COLUMNS
             expected_bytes = expected_reals * REAL_SIZE
@@ -570,8 +755,9 @@ class CSVtoPLCApp:
             send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
 
-            total_rows = len(self.df)
+            total_rows = len(self.sending_df)
             self.log(f'--- Starting send loop to {group}:{send_port} ---')
+            self.log(f'Data: {self.sending_label}')
             self.log(packet_format_summary())
             self.log(
                 'Order (single packet): [RTU_Number, Tank_Number, Column_Size, '
@@ -580,7 +766,7 @@ class CSVtoPLCApp:
             )
             self.log(f'Loop: repeat full send every {ROUND_DELAY_SEC * 1000:.0f} ms (click Stop to end)')
             self._log_header_preview()
-            self._log_csv_preview()
+            self._log_csv_preview(self.sending_df, 'Data to send')
             self.log('PLC reply verification: disabled (fire-and-forget)')
             self._log_byte_distribution(total_rows)
 
@@ -606,9 +792,10 @@ class CSVtoPLCApp:
             self.set_status(summary, color)
 
         except Exception as e:
-            self.log(f'FATAL: {e}')
-            self.set_status(f'Failed: {e}', 'red')
-            self.root.after(0, lambda: messagebox.showerror('Send failed', str(e)))
+            msg = str(e)
+            self.log(f'FATAL: {msg}')
+            self.set_status(f'Failed: {msg}', 'red')
+            self.root.after(0, lambda: messagebox.showerror('Send failed', msg))
         finally:
             if send_sock:
                 send_sock.close()
@@ -618,6 +805,13 @@ class CSVtoPLCApp:
                 0,
                 lambda: self.send_btn.config(state='normal', text='Send to PLC', bg='#4CAF50'),
             )
+
+
+def _format_issues(issues):
+    shown = '\n'.join(f'• {i}' for i in issues[:MAX_LISTED_ISSUES])
+    if len(issues) > MAX_LISTED_ISSUES:
+        shown += f'\n… and {len(issues) - MAX_LISTED_ISSUES} more (see Show comparison)'
+    return shown
 
 
 if __name__ == '__main__':

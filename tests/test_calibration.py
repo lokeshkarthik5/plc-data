@@ -1,0 +1,267 @@
+import struct
+
+import pandas as pd
+import pytest
+from conftest import FO1_HEADER
+from hypothesis import example, given
+from hypothesis import strategies as st
+
+from tankgauge.calibration import (
+    CalibrationResult,
+    Mode,
+    Point,
+    calibrate,
+    clean_table,
+    interp,
+    preview_reading,
+    validate_calibration,
+)
+from tankgauge.packet import NUM_HEADER_REALS, PLC_BUFFER_REALS, build_combined_packet
+
+TOL = 1e-4
+Base = tuple[list[float], list[float], list[float]]
+
+
+def run(base: Base, points: list[Point], mode: Mode) -> CalibrationResult:
+    levels, volumes, weights = base
+    return calibrate(levels, volumes, weights, points, mode, 824.0, tank_height=2.03)
+
+
+def volume_at(result: CalibrationResult, level: float) -> float:
+    return result.volumes[result.levels.index(level)]
+
+
+def packet_for(result: CalibrationResult) -> bytes:
+    df = pd.DataFrame({'COL1': result.levels, 'COL2': result.volumes, 'COL3': result.weights})
+    return build_combined_packet(FO1_HEADER, df)
+
+
+# ---- interp ----
+
+def test_interp_basic_and_endpoints() -> None:
+    assert interp([0, 1, 2], [0, 10, 30], 0.5) == pytest.approx(5)
+    assert interp([0, 1, 2], [0, 10, 30], 1) == pytest.approx(10)
+    assert interp([0, 1, 2], [0, 10, 30], 2) == 30
+
+
+def test_interp_out_of_range() -> None:
+    with pytest.raises(ValueError):
+        interp([0, 1], [0, 1], -0.01)
+    with pytest.raises(ValueError):
+        interp([0, 1], [0, 1], 1.01)
+
+
+def test_interp_skips_zero_width_segment() -> None:
+    assert interp([0, 1, 1, 2], [0, 10, 10, 30], 1) == pytest.approx(10)
+    assert interp([0, 1, 2, 2], [0, 10, 30, 30], 2) == 30
+
+
+# ---- clean_table ----
+
+def test_clean_table_fo1(fo1_base: Base) -> None:
+    levels, volumes, _ = fo1_base
+    assert len(levels) == 408
+    out_levels, out_volumes, warnings, errors = clean_table(levels, volumes, 2.03)
+    assert len(out_levels) == len(out_volumes) == 407
+    assert out_levels[-1] == 2.03
+    assert errors == []
+    assert any('1 duplicate' in w for w in warnings)
+
+
+def test_clean_table_sorts_and_flags_problems() -> None:
+    levels, volumes, warnings, errors = clean_table([0.1, 0.0, 0.2], [1.0, 0.5, 2.0], 0.2)
+    assert levels == [0.0, 0.1, 0.2] and volumes == [0.5, 1.0, 2.0]
+    assert warnings == [] and errors == []
+
+    _, _, _, errors = clean_table([0.0, 0.1, 0.1], [0.0, 1.0, 1.1], 0.1)
+    assert any('two volumes' in e for e in errors)
+    _, _, _, errors = clean_table([0.0, 0.1, 0.2], [0.0, 1.0, 0.9], 0.2)
+    assert any('decreases' in e for e in errors)
+    _, _, _, errors = clean_table([0.05, 0.1], [0.0, 1.0], 0.1)
+    assert any('start at 0' in e for e in errors)
+    _, _, warnings, errors = clean_table([0.0, 0.1], [0.0, 1.0], 0.2)
+    assert errors == [] and any('Tank_Height' in w for w in warnings)
+
+
+# ---- calibrate ----
+
+@pytest.mark.parametrize('mode', [Mode.OFFSET, Mode.DIRECT])
+def test_matches_calibration_points(fo1_base: Base, fo1_points: list[Point], mode: Mode) -> None:
+    result = run(fo1_base, fo1_points, mode)
+    for p in fo1_points:
+        assert volume_at(result, p.level) == pytest.approx(p.volume, abs=TOL)
+
+
+def test_modes_at_0_05(fo1_base: Base, fo1_points: list[Point]) -> None:
+    assert volume_at(run(fo1_base, fo1_points, Mode.DIRECT), 0.05) == pytest.approx(0.135, abs=TOL)
+    assert volume_at(run(fo1_base, fo1_points, Mode.OFFSET), 0.05) == pytest.approx(0.100, abs=TOL)
+    assert volume_at(run(fo1_base, fo1_points, Mode.NONE), 0.05) == pytest.approx(0.110, abs=TOL)
+
+
+@pytest.mark.parametrize(('level', 'expected'), [
+    (0.10, 0.230), (0.11, 0.275), (0.12, 0.330), (0.15, 0.505), (0.18, 0.700), (0.20, 0.850),
+])
+def test_offset_worked_rows(fo1_base: Base, fo1_points: list[Point], level: float, expected: float) -> None:
+    assert volume_at(run(fo1_base, fo1_points, Mode.OFFSET), level) == pytest.approx(expected, abs=TOL)
+
+
+@pytest.mark.parametrize(('level', 'offset', 'direct'), [(0.05, 0.100, 0.135), (0.15, 0.505, 0.540), (1.95, 12.245, 12.250)])
+def test_offset_vs_direct_table(fo1_base: Base, fo1_points: list[Point], level: float, offset: float,
+                                direct: float) -> None:
+    assert volume_at(run(fo1_base, fo1_points, Mode.OFFSET), level) == pytest.approx(offset, abs=TOL)
+    assert volume_at(run(fo1_base, fo1_points, Mode.DIRECT), level) == pytest.approx(direct, abs=TOL)
+
+
+@pytest.mark.parametrize('mode', list(Mode))
+def test_output_levels_are_cleaned_base_levels(fo1_base: Base, fo1_points: list[Point], mode: Mode) -> None:
+    levels, volumes, _ = fo1_base
+    cleaned_levels, _, _, _ = clean_table(levels, volumes, 2.03)
+    result = run(fo1_base, fo1_points, mode)
+    assert result.levels == cleaned_levels
+    assert len(result.volumes) == len(result.weights) == 407
+
+
+def test_none_mode_keeps_base_table(fo1_base: Base) -> None:
+    levels, volumes, weights = fo1_base
+    result = run(fo1_base, [], Mode.NONE)
+    assert result.volumes == volumes[:407]
+    assert result.weights == weights[:407]
+    assert result.errors == []
+
+
+def test_weights_from_density(fo1_base: Base, fo1_points: list[Point]) -> None:
+    result = run(fo1_base, fo1_points, Mode.DIRECT)
+    for v, w in zip(result.volumes, result.weights, strict=True):
+        assert w == pytest.approx(v * 0.824, abs=TOL)
+
+
+def test_warnings(fo1_base: Base, fo1_points: list[Point]) -> None:
+    result = run(fo1_base, fo1_points, Mode.DIRECT)
+    assert any('0.850' in w and '0.824' in w for w in result.warnings)
+    assert '1.80–1.90 m: 2.00 m³/m vs base 6.80' in result.warnings
+    assert '2.00–2.03 m: 16.67 m³/m vs base 6.67' in result.warnings
+    assert result.errors == []
+
+
+def test_fo1_offset_is_not_monotonic(fo1_base: Base, fo1_points: list[Point]) -> None:
+    """FO1 base is flat at 0–0.005 m and 0.015–0.02 m while the correction falls, so Offset
+    dips by 2 L twice. The spec requires an error; see docs/calibration-spec.md §10."""
+    result = run(fo1_base, fo1_points, Mode.OFFSET)
+    assert result.errors == [
+        'Calibrated volume decreases from 0.04 m³ at 0 m to 0.038 m³ at 0.005 m.',
+        'Calibrated volume decreases from 0.054 m³ at 0.015 m to 0.052 m³ at 0.02 m.',
+    ]
+
+
+# ---- validation errors ----
+
+def test_calibration_missing_top(fo1_base: Base, fo1_points: list[Point]) -> None:
+    result = run(fo1_base, fo1_points[:-1], Mode.OFFSET)
+    assert any('last base level 2.03' in e for e in result.errors)
+    assert result.volumes == []
+
+
+def test_calibration_decreasing_volume() -> None:
+    errors = validate_calibration([Point(0, 0), Point(0.1, 1.0), Point(0.2, 0.9)], [0.0, 0.2])
+    assert any('volume decreases' in e for e in errors)
+
+
+def test_calibration_same_level_two_volumes() -> None:
+    errors = validate_calibration([Point(0, 0), Point(0.1, 1.0), Point(0.1, 1.2), Point(0.2, 2)], [0.0, 0.2])
+    assert any('two volumes' in e for e in errors)
+
+
+def test_calibration_too_few_points() -> None:
+    assert validate_calibration([Point(0, 0)], [0.0, 0.2])
+
+
+def test_calibration_within_1mm_of_ends_is_accepted() -> None:
+    assert validate_calibration([Point(0.0005, 0), Point(0.1995, 2)], [0.0, 0.2]) == []
+
+
+# ---- packet ----
+
+@pytest.mark.parametrize('mode', [Mode.OFFSET, Mode.DIRECT])
+def test_calibrated_packet(fo1_base: Base, fo1_points: list[Point], mode: Mode) -> None:
+    result = run(fo1_base, fo1_points, mode)
+    packet = packet_for(result)
+    n = len(packet) // 4
+    assert n == 8 + 3 * 407 == 1229
+    assert n <= PLC_BUFFER_REALS
+    vals = struct.unpack(f'<{n}f', packet)
+    expected_header = struct.unpack('<8f', struct.pack('<8f', *(v for _, v in FO1_HEADER)))
+    assert vals[:NUM_HEADER_REALS] == expected_header
+    col2 = vals[NUM_HEADER_REALS + 407:NUM_HEADER_REALS + 2 * 407]
+    for got, want in zip(col2, result.volumes, strict=True):
+        assert got == pytest.approx(want, rel=1e-6, abs=1e-6)
+
+
+def test_calibrated_vs_raw_differ_only_in_col2_col3(fo1_base: Base, fo1_points: list[Point]) -> None:
+    raw = packet_for(run(fo1_base, fo1_points, Mode.NONE))
+    cal = packet_for(run(fo1_base, fo1_points, Mode.DIRECT))
+    assert len(raw) == len(cal)
+    col2_start = (NUM_HEADER_REALS + 407) * 4
+    assert raw[:col2_start] == cal[:col2_start]
+    assert raw[col2_start:] != cal[col2_start:]
+
+
+# ---- preview_reading ----
+
+FO1_HEADER_MAP = dict(FO1_HEADER)
+
+
+@pytest.mark.parametrize(('mode', 'expected'), [
+    (Mode.NONE, 0.313911), (Mode.DIRECT, 0.329063), (Mode.OFFSET, 0.307878),
+])
+def test_preview_4_5_mA(fo1_base: Base, fo1_points: list[Point], mode: Mode, expected: float) -> None:
+    result = run(fo1_base, fo1_points, mode)
+    reading = preview_reading(4.5, FO1_HEADER_MAP, result.levels, result.volumes)
+    assert reading['status'] == 'OK'
+    assert reading['pressure_bar'] == pytest.approx(0.009375, abs=TOL)
+    assert reading['level_m'] == pytest.approx(0.115978, abs=TOL)
+    assert reading['volume_m3'] == pytest.approx(expected, abs=TOL)
+    assert reading['litres'] == pytest.approx(expected * 1000, abs=0.1)
+    assert reading['tonnes'] == pytest.approx(expected * 0.824, abs=TOL)
+
+
+@pytest.mark.parametrize('mA', [3.5, 21.0])
+def test_preview_sensor_fault(fo1_base: Base, fo1_points: list[Point], mA: float) -> None:
+    result = run(fo1_base, fo1_points, Mode.NONE)
+    assert preview_reading(mA, FO1_HEADER_MAP, result.levels, result.volumes)['status'] == 'SENSOR_FAULT'
+
+
+def test_preview_over_range(fo1_base: Base, fo1_points: list[Point]) -> None:
+    result = run(fo1_base, fo1_points, Mode.NONE)
+    reading = preview_reading(15.0, FO1_HEADER_MAP, result.levels, result.volumes)
+    assert reading['status'] == 'OVER_RANGE'
+    assert reading['level_m'] == pytest.approx(2.03, abs=TOL)
+    assert reading['level_pct'] == pytest.approx(100, abs=TOL)
+    assert reading['volume_pct'] == pytest.approx(100, abs=TOL)
+
+
+def test_preview_below_4mA_clamps_to_empty(fo1_base: Base, fo1_points: list[Point]) -> None:
+    result = run(fo1_base, fo1_points, Mode.NONE)
+    reading = preview_reading(3.9, FO1_HEADER_MAP, result.levels, result.volumes)
+    assert reading['status'] == 'OK'
+    assert reading['level_m'] == 0
+
+
+@pytest.mark.parametrize('mode', [
+    Mode.NONE,
+    Mode.DIRECT,
+    pytest.param(Mode.OFFSET, marks=pytest.mark.xfail(
+        strict=True, reason='FO1 Offset table is not monotonic (see test_fo1_offset_is_not_monotonic)')),
+])
+def test_preview_volume_non_decreasing(fo1_base: Base, fo1_points: list[Point], mode: Mode) -> None:
+    result = run(fo1_base, fo1_points, mode)
+
+    @given(st.floats(4, 20), st.floats(4, 20))
+    @example(4.0, 4.0216)  # 0 m → 0.005 m, where FO1 Offset dips
+    def check(a: float, b: float) -> None:
+        lo, hi = sorted((a, b))
+        v_lo = preview_reading(lo, FO1_HEADER_MAP, result.levels, result.volumes)['volume_m3']
+        v_hi = preview_reading(hi, FO1_HEADER_MAP, result.levels, result.volumes)['volume_m3']
+        assert v_lo is not None and v_hi is not None
+        assert v_lo <= v_hi
+
+    check()
