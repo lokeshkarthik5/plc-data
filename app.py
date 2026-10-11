@@ -15,6 +15,7 @@ from tankgauge.packet import (
     build_combined_packet,
     packet_format_summary,
 )
+from tankgauge.tanks import TANKS, preset_header_fields
 
 # ---- UDP multicast defaults ----
 MULTICAST_GROUP = '239.255.43.21'
@@ -22,20 +23,9 @@ RTU_LISTEN_PORT = 4001     # PLC listen port (SCADA -> RTU)
 RTU_SEND_PORT = 9001      # PLC send port (RTU -> SCADA)
 ROUND_DELAY_SEC = 0.1       # Pause between complete send rounds
 
-# Tank list: RTU 4 = tanks 1–8, RTU 5 = tanks 9–12
-TANK_OPTIONS = (
-    {'tank': 1, 'rtu': 4.0, 'name': '1. FUEL OIL TANK 01'},
-    {'tank': 2, 'rtu': 4.0, 'name': '2. FUEL OIL TANK 02'},
-    {'tank': 3, 'rtu': 4.0, 'name': '3. FUEL OIL TANK 03'},
-    {'tank': 4, 'rtu': 4.0, 'name': '4. FO RU TANK 01'},
-    {'tank': 5, 'rtu': 4.0, 'name': '5. FO RU TANK 02'},
-    {'tank': 6, 'rtu': 4.0, 'name': '6. FO RU TANK 03'},
-    {'tank': 7, 'rtu': 4.0, 'name': '7. FO RU TANK 04'},
-    {'tank': 8, 'rtu': 4.0, 'name': '8. LO TANK'},
-    {'tank': 9, 'rtu': 5.0, 'name': '9. FRESH WATER TANK'},
-    {'tank': 10, 'rtu': 5.0, 'name': '10. GREY WATER TANK'},
-    {'tank': 11, 'rtu': 5.0, 'name': '11. BILGE OIL TANK'},
-    {'tank': 12, 'rtu': 5.0, 'name': '12. DIRTY OIL TANK'},
+# Tank list: RTU 4 = tanks 1–8, RTU 5 = tanks 9–12 (see tankgauge.tanks)
+TANK_OPTIONS = tuple(
+    {'tank': t.number, 'rtu': t.rtu, 'name': t.label, 'preset': t} for t in TANKS
 )
 
 # Remaining header REALs (after RTU_Number and Tank_Number)
@@ -84,6 +74,7 @@ class CSVtoPLCApp:
         self.stop_sending = False
 
         self._build_ui()
+        self._apply_tank_preset()
 
     def _build_ui(self):
         pad = {'padx': 10, 'pady': 5}
@@ -329,8 +320,16 @@ class CSVtoPLCApp:
         return TANK_OPTIONS[0]
 
     def _on_tank_selected(self, _event=None):
+        self._apply_tank_preset()
+        tank = self._selected_tank()
+        self.log(f'Tank preset applied: {tank["name"]} (header fields remain editable)')
+
+    def _apply_tank_preset(self):
+        """Fill RTU and header fields from the selected tank's preset."""
         tank = self._selected_tank()
         self.rtu_number.set(str(tank['rtu']))
+        for key, value in preset_header_fields(tank['preset']).items():
+            self.header_vars[key].set(f'{value:g}')
 
     def _header_values(self):
         """Read and validate the 8 frame header REALs. Column_Size defaults to row count."""
