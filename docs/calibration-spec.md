@@ -2,6 +2,59 @@
 
 Audience: Claude Code working in this repo. Read `app.py` fully before changing anything. Work in the commit order in §9 and run tests after each step.
 
+> **Change 1 (supersedes the calibration CSV):** base table and calibration points both come from **one .xlsx workbook**, from different sheets. See §0. §1–§9 are already implemented on this branch; §0 lists only what changes.
+
+## 0. Change 1 — single workbook input
+
+### 0.1 Source layout (real file: `tests/fixtures/Tank_Interpolation_Calibration.xlsx`)
+
+| What | Sheet | Header row | Columns | Rows |
+|---|---|---|---|---|
+| Base table | `Sounding Table` | 1 | A `Level_m`, B `Volume_m3`, C `Weight` | 2–409 (408 rows, final row duplicated) |
+| Calibration points | `Sounding Table_Calibrated` | 3 | H `Level_m`, I `Corrected_Volume_m3` | 4–25 (22 points) |
+
+Every other column in the calibration sheet (A–C copy of base, D/F/J/M derived, L, AF–AI scratch) is **ignored**. The calibration sheet has four columns headed `Level_m` (A, H, L, AF) — header matching must anchor on `Corrected_Volume_m3`, not on `Level_m`.
+
+### 0.2 New module `tankgauge/workbook.py`
+
+- `list_sheets(path) -> list[str]`
+- `read_base_sheet(path, sheet) -> pandas.DataFrame` — header row 1, all columns; feeds the existing 3-column mapping unchanged.
+- `find_calibration_columns(path, sheet) -> CalibrationSource | None` — scan rows 1–10 for a cell whose text, case-insensitive, contains `corrected` and `volume`. Volume column = that column; level column = nearest column **to its left** whose header contains `level`. Header row = that row. Return `None` if not found.
+- `read_calibration_points(path, sheet, level_col, volume_col, header_row) -> (list[Point], str)` — read numeric rows below the header until the first blank level cell; return points plus a source label like `"Sounding Table_Calibrated!H4:I25"`.
+- Open with `openpyxl.load_workbook(path, read_only=True, data_only=True)`. If a selected cell is a formula with no cached value (`None` where a number is expected inside the range), raise `ValueError("… open and save the workbook in Excel, then reload")`.
+- Strip whitespace/non-breaking spaces from headers before matching.
+
+### 0.3 UI changes
+
+1. File picker (`Browse…`) accepts `*.xlsx` and `*.csv`. CSV keeps today's behaviour (base table only, calibration disabled, mode forced to None).
+2. For `.xlsx`, add two comboboxes under the file label:
+   - **Base sheet** — default `Sounding Table` if present, else first sheet. Changing it reloads the base table into the existing column mapping.
+   - **Calibration sheet** — `(none)` + all sheets; default the first sheet where `find_calibration_columns` succeeds (→ `Sounding Table_Calibrated`).
+3. If the chosen calibration sheet has no detectable columns, show two column comboboxes (level, corrected volume) populated from that sheet's header candidates in rows 1–10; user picks, then points load.
+4. **Remove** the "Load calibration CSV…" button, `pick_calibration_file`, and `load_points_csv` (and its tests).
+5. Calibration sheet `(none)` → mode forced to None and the mode combobox disabled.
+6. Log on load: `Base: 'Sounding Table' 408 rows · Calibration: Sounding Table_Calibrated!H4:I25, 22 points`. Use the same label in the send-session log instead of the calibration filename.
+7. Calculation (§2), send path, packet and validation are **unchanged**.
+
+### 0.4 Dependencies / build
+
+- `requirements.txt`: add `openpyxl`.
+- `build.yml`: install it; add `--hidden-import openpyxl` to the `pyinstaller` command.
+
+### 0.5 Tests (`tests/test_workbook.py`, using the fixture xlsx)
+
+- `list_sheets` returns the 4 sheet names.
+- `read_base_sheet(..., 'Sounding Table')` → 408 rows; first row (0, 0.03, 0.02); last row (2.03, 13.06, 11.1).
+- `find_calibration_columns(..., 'Sounding Table_Calibrated')` → volume col I, level col H, header row 3 (**not** A, L or AF).
+- `read_calibration_points` → 22 points equal to `tests/fixtures/fo1_calibration.csv`; label `Sounding Table_Calibrated!H4:I25`.
+- `find_calibration_columns(..., 'Sounding Table')` → `None`.
+- End-to-end: workbook → clean → Offset calibrate → packet = 1229 REALs; COL2 at 0.15 m = 0.505.
+- Existing calibration/packet tests stay green.
+
+### 0.6 Commit order
+
+1. `workbook.py` + tests + fixture. 2. UI: xlsx picker + sheet comboboxes; remove calibration CSV path. 3. Build deps. Run `pytest` after each.
+
 ## 1. Context
 
 `app.py` is a Tkinter tool ("CSV to PLC"). It loads a CSV sounding table, maps 3 columns and sends **one UDP multicast packet every 100 ms** to a CODESYS PLC:
@@ -29,7 +82,7 @@ The **PLC** converts mA → level and interpolates volume from this table. This 
 
 Inputs:
 - **Base table** — shipyard sounding table, (level, volume) every 5 mm. FO Tank 1: 408 rows, 0 → 2.03 m.
-- **Calibration points** — (level, corrected volume) measured on site, every 0.1 m. FO Tank 1: 22 points.
+- **Calibration points** — (level, corrected volume) measured on site, every 0.1 m. FO Tank 1: 22 points. Read from a separate sheet of the same workbook (§0).
 
 Output levels are **always the base table's levels** (same 5 mm grid, same row count after de-duplication). Only volumes and weights change.
 
