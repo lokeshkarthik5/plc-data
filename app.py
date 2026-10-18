@@ -6,7 +6,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import pandas as pd
 
-from tankgauge.calibration import Mode, calibrate, clean_table, load_points_csv, preview_reading
+from tankgauge.calibration import Mode, calibrate, load_tank_file
 from tankgauge.packet import (
     COLUMN_LABELS,
     NUM_COLUMNS,
@@ -45,11 +45,6 @@ SAMPLE_CSV_ROWS = (
     {'Channel': 103, 'PAO': 3.33, 'DAO': 7.73},
 )
 
-CAL_MODE_LABELS = {
-    'None': Mode.NONE,
-    'Offset (recommended)': Mode.OFFSET,
-    'Direct': Mode.DIRECT,
-}
 MAX_LISTED_ISSUES = 10
 
 
@@ -84,13 +79,10 @@ class CSVtoPLCApp:
         self.cal_points = None
         self.cal_filename = None
         self.cal_result = None
+        self.cal_message = ''
         self.send_df = None
         self.sending_df = None
         self.sending_label = ''
-        self.cal_file_text = tk.StringVar(value='No calibration file')
-        self.cal_mode = tk.StringVar(value='Offset (recommended)')
-        self.cal_status_text = tk.StringVar(value='Load a sounding table CSV')
-        self.check_mA = tk.StringVar(value='4.5')
 
         self._build_ui()
         self._apply_tank_preset()
@@ -155,7 +147,7 @@ class CSVtoPLCApp:
         ).grid(row=4, column=0, columnspan=4, sticky='w', padx=10, pady=(0, 6))
 
         # --- File selection ---
-        file_frame = ttk.LabelFrame(self.root, text='CSV File')
+        file_frame = ttk.LabelFrame(self.root, text='Tank file')
         file_frame.pack(fill='x', **pad)
 
         ttk.Label(file_frame, textvariable=self.filepath, foreground='blue').pack(side='left', padx=10, pady=8)
@@ -190,54 +182,14 @@ class CSVtoPLCApp:
 
         self.mapping_hint = ttk.Label(
             data_frame,
-            text='Load a CSV, then choose which file columns to use.',
+            text='Load a tank file, then choose which columns to send.',
             foreground='gray',
         )
         self.mapping_hint.grid(row=3, column=0, columnspan=2, sticky='w', padx=10, pady=(0, 6))
 
-        # --- Calibration ---
-        cal_frame = ttk.LabelFrame(self.root, text='Calibration')
-        cal_frame.pack(fill='x', **pad)
-        cal_frame.columnconfigure(1, weight=1)
-
-        ttk.Button(cal_frame, text='Load calibration CSV…', command=self.pick_calibration_file).grid(
-            row=0, column=0, sticky='w', padx=(10, 5), pady=4,
-        )
-        ttk.Label(cal_frame, textvariable=self.cal_file_text, foreground='blue').grid(
-            row=0, column=1, columnspan=2, sticky='w', padx=(0, 10), pady=4,
-        )
-        ttk.Label(cal_frame, text='Mode:').grid(row=1, column=0, sticky='e', padx=(10, 5), pady=4)
-        mode_combo = ttk.Combobox(
-            cal_frame, textvariable=self.cal_mode, values=list(CAL_MODE_LABELS), state='readonly', width=22,
-        )
-        mode_combo.grid(row=1, column=1, sticky='w', padx=(0, 10), pady=4)
-        mode_combo.bind('<<ComboboxSelected>>', lambda _e: self._recalibrate(log=True))
-        ttk.Button(cal_frame, text='Show comparison', command=self.show_comparison).grid(
-            row=1, column=2, sticky='e', padx=(0, 10), pady=4,
-        )
-        self.cal_status_label = ttk.Label(cal_frame, textvariable=self.cal_status_text, foreground='gray')
-        self.cal_status_label.grid(row=2, column=0, columnspan=3, sticky='w', padx=10, pady=(0, 6))
-
-        check_frame = ttk.Frame(cal_frame)
-        check_frame.grid(row=3, column=0, columnspan=3, sticky='w', padx=10, pady=(0, 6))
-        ttk.Label(check_frame, text='Check reading at').pack(side='left')
-        ttk.Entry(check_frame, textvariable=self.check_mA, width=8).pack(side='left', padx=5)
-        ttk.Label(check_frame, text='mA').pack(side='left')
-        ttk.Button(check_frame, text='Check', command=self.check_reading).pack(side='left', padx=(10, 0))
-
-        # --- Log ---
-        log_frame = ttk.LabelFrame(self.root, text='Log')
-        log_frame.pack(fill='both', expand=True, **pad)
-
-        self.log_box = tk.Text(log_frame, height=12, wrap='word')
-        scrollbar = ttk.Scrollbar(log_frame, command=self.log_box.yview)
-        self.log_box.configure(yscrollcommand=scrollbar.set)
-        self.log_box.pack(side='left', fill='both', expand=True, padx=(5, 0), pady=5)
-        scrollbar.pack(side='right', fill='y', pady=5)
-
-        # --- Action button ---
+        # Packed before the log so the button stays on screen when the log grows.
         btn_frame = ttk.Frame(self.root)
-        btn_frame.pack(fill='x', **pad)
+        btn_frame.pack(side='bottom', fill='x', **pad)
 
         self.send_btn = tk.Button(btn_frame, text='Send to PLC',
                                   command=self.start_send,
@@ -246,16 +198,24 @@ class CSVtoPLCApp:
                                   height=2)
         self.send_btn.pack(fill='x', padx=10)
 
-        # --- Send status ---
         status_frame = ttk.Frame(self.root)
-        status_frame.pack(fill='x', padx=20, pady=(0, 5))
+        status_frame.pack(side='bottom', fill='x', padx=20, pady=(0, 5))
         ttk.Label(status_frame, text='Status:').pack(side='left')
         self.status_label = ttk.Label(status_frame, textvariable=self.status_text)
         self.status_label.pack(side='left', padx=(5, 0))
 
-        # --- Progress bar ---
         self.progress = ttk.Progressbar(self.root, mode='determinate')
-        self.progress.pack(fill='x', padx=20, pady=5)
+        self.progress.pack(side='bottom', fill='x', padx=20, pady=5)
+
+        # --- Log ---
+        log_frame = ttk.LabelFrame(self.root, text='Log')
+        log_frame.pack(fill='both', expand=True, **pad)
+
+        self.log_box = tk.Text(log_frame, height=8, wrap='word')
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=scrollbar.set)
+        self.log_box.pack(side='left', fill='both', expand=True, padx=(5, 0), pady=5)
+        scrollbar.pack(side='right', fill='y', pady=5)
 
     # ---------- CSV load & column mapping ----------
 
@@ -295,7 +255,7 @@ class CSVtoPLCApp:
 
     def _column_mapping_error(self):
         if self.raw_df is None:
-            return 'No CSV loaded.'
+            return 'No tank file loaded.'
         c1_s, c2_s, c3_s = self.col1.get(), self.col2.get(), self.col3.get()
         if not c1_s or not c2_s or not c3_s:
             return 'Select a column for Column 1, Column 2, and Column 3.'
@@ -461,6 +421,7 @@ class CSVtoPLCApp:
 
     def load_sample_data(self):
         try:
+            self._set_calibration_points([], None)
             df = pd.DataFrame(SAMPLE_CSV_ROWS)
             self._load_dataframe(df, 'sample_data (in-memory)', is_sample=True)
             self.log('Tip: use Load sample data + Send to PLC to verify all 3 columns in the log.')
@@ -469,38 +430,31 @@ class CSVtoPLCApp:
 
     def pick_file(self):
         path = filedialog.askopenfilename(
-            title='Choose CSV',
-            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')]
+            title='Choose tank file',
+            filetypes=[
+                ('Tank files', '*.xlsx *.xlsm *.csv'),
+                ('Excel files', '*.xlsx *.xlsm'),
+                ('CSV files', '*.csv'),
+                ('All files', '*.*'),
+            ],
         )
         if not path:
             return
         try:
-            self._load_dataframe(pd.read_csv(path), path.split('/')[-1])
+            loaded = load_tank_file(path)
+            self._set_calibration_points(loaded.points, loaded.calibration_sheet)
+            self._load_dataframe(loaded.table, path.split('/')[-1])
         except Exception as e:
-            messagebox.showerror('Error reading CSV', str(e))
+            messagebox.showerror('Error reading tank file', str(e))
 
     # ---------- Calibration ----------
 
-    def pick_calibration_file(self):
-        path = filedialog.askopenfilename(
-            title='Choose calibration CSV (level, volume)',
-            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')]
-        )
-        if not path:
-            return
-        try:
-            points = load_points_csv(path)
-        except Exception as e:
-            messagebox.showerror('Error reading calibration CSV', str(e))
-            return
-        self.cal_points = points
-        self.cal_filename = path.split('/')[-1]
-        self.cal_file_text.set(f'{self.cal_filename} ({len(points)} points)')
-        self.log(f'Loaded {len(points)} calibration points from {self.cal_filename}')
-        self._recalibrate(log=True)
-
-    def _selected_mode(self):
-        return CAL_MODE_LABELS.get(self.cal_mode.get(), Mode.NONE)
+    def _set_calibration_points(self, points, sheet_name):
+        """Calibration points come from the second sheet of the loaded tank file."""
+        self.cal_points = points or None
+        self.cal_filename = sheet_name
+        if sheet_name and points:
+            self.log(f'Calibration points: {len(points)} from sheet {sheet_name}')
 
     def _header_float(self, key):
         try:
@@ -508,122 +462,37 @@ class CSVtoPLCApp:
         except ValueError:
             return None
 
-    def _set_cal_status(self, text, color):
-        self.cal_status_text.set(text)
-        self.cal_status_label.configure(foreground=color)
-
     def _recalibrate(self, log=False):
-        """Rebuild the table to send from the mapped CSV, calibration points, mode and Density."""
+        """Rebuild the table to send. A second sheet is applied in offset mode; otherwise the base table is sent."""
         self.cal_result = None
         self.send_df = None
+        self.cal_message = ''
         if self.df is None:
-            self._set_cal_status('Load a sounding table CSV', 'gray')
+            self.cal_message = 'Load a tank file'
             return
         if self.is_sample:
             self.send_df = self.df
-            self._set_cal_status('Sample data — not a sounding table, sent as loaded (no calibration)', 'gray')
             return
-        mode = self._selected_mode()
+        mode = Mode.OFFSET if self.cal_points else Mode.NONE
         density = self._header_float('density')
-        if density is None or density <= 0:
-            self._set_cal_status('Density must be a positive number to calibrate', 'red')
-            return
-        if mode is not Mode.NONE and not self.cal_points:
-            self._set_cal_status('Load a calibration CSV, or choose mode None', 'red')
+        if mode is not Mode.NONE and (density is None or density <= 0):
+            self.cal_message = 'Density must be a positive number to calibrate'
             return
 
         result = calibrate(
             self.df['COL1'].tolist(), self.df['COL2'].tolist(), self.df['COL3'].tolist(),
-            self.cal_points or [], mode, density, tank_height=self._header_float('tank_height'),
+            self.cal_points or [], mode, density or 0, tank_height=self._header_float('tank_height'),
         )
         self.cal_result = result
         if result.levels:
             self.send_df = pd.DataFrame({'COL1': result.levels, 'COL2': result.volumes, 'COL3': result.weights})
 
-        what = 'Calibrated' if mode is not Mode.NONE else 'Base table (no calibration)'
-        color = 'red' if result.errors else 'darkorange' if result.warnings else 'green'
-        self._set_cal_status(
-            f'{what} {len(result.levels)} rows · {len(result.warnings)} warnings · {len(result.errors)} errors',
-            color,
+        what = 'Calibrated' if mode is not Mode.NONE else 'Base table'
+        self.cal_message = (
+            f'{what} {len(result.levels)} rows · {len(result.warnings)} warnings · {len(result.errors)} errors'
         )
         if log:
-            self.log(f'Calibration: {self.cal_status_text.get()}')
-
-    def show_comparison(self):
-        self._recalibrate()
-        result = self.cal_result
-        if result is None:
-            self.log(f'Comparison: {self.cal_status_text.get()}')
-            return
-        mode = self._selected_mode()
-        self.log(f'--- Calibration comparison: mode {self.cal_mode.get()}, file {self.cal_filename or "none"} ---')
-        base_levels, base_volumes, _, _ = clean_table(
-            self.df['COL1'].tolist(), self.df['COL2'].tolist(), None,
-        )
-        if mode is not Mode.NONE and result.levels:
-            base_at = dict(zip(base_levels, base_volumes, strict=True))
-            cal_at = dict(zip(result.levels, result.volumes, strict=True))
-            self.log('  Level m | Corrected | Base V | Calibrated V | Δ (cal − base)')
-            for p in self.cal_points:
-                if p.level not in base_at:
-                    self.log(f'  {p.level:7.3f} | {p.volume:9.3f} | (not on base grid)')
-                    continue
-                base_v, cal_v = base_at[p.level], cal_at[p.level]
-                self.log(
-                    f'  {p.level:7.3f} | {p.volume:9.3f} | {base_v:6.3f} | {cal_v:12.3f} | {cal_v - base_v:+.3f}'
-                )
-            self.log('  Cross-section per calibration segment (ΔV/ΔL):')
-            for p1, p2 in zip(self.cal_points, self.cal_points[1:], strict=False):
-                if p1.level not in base_at or p2.level not in base_at:
-                    continue
-                span = p2.level - p1.level
-                base_slope = (base_at[p2.level] - base_at[p1.level]) / span
-                cal_slope = (cal_at[p2.level] - cal_at[p1.level]) / span
-                pct = f'{(cal_slope - base_slope) / base_slope * 100:+.0f}%' if base_slope else 'n/a'
-                self.log(
-                    f'  {p1.level:.2f}–{p2.level:.2f} m: {cal_slope:.2f} m³/m vs base {base_slope:.2f} ({pct})'
-                )
-        for w in result.warnings:
-            self.log(f'  WARNING: {w}')
-        for e in result.errors:
-            self.log(f'  ERROR: {e}')
-        self.log(f'--- {self.cal_status_text.get()} ---')
-
-    def check_reading(self):
-        """Log what the PLC should show for an mA value, using the table selected for sending."""
-        try:
-            mA = float(self.check_mA.get().strip())
-        except ValueError:
-            messagebox.showwarning('Check reading', 'mA must be a number.')
-            return
-        self._recalibrate()
-        if self.send_df is None:
-            self.log(f'Check reading: {self.cal_status_text.get()}')
-            return
-        try:
-            header = dict(self._header_values(self.send_df))
-        except ValueError as e:
-            messagebox.showwarning('Tank details', str(e))
-            return
-        source = 'sample data' if self.is_sample else self.cal_mode.get()
-        r = preview_reading(mA, header, self.send_df['COL1'].tolist(), self.send_df['COL2'].tolist())
-        if r['status'] == 'SENSOR_FAULT':
-            self.log(f'Check {mA:g} mA [{source}]: SENSOR_FAULT (outside 3.8–20.5 mA, NAMUR NE43)')
-        else:
-            self.log(
-                f'Check {mA:g} mA [{source}]: {r["status"]} · P {r["pressure_bar"]:.6f} bar · '
-                f'L {r["level_m"]:.6f} m ({r["level_pct"] or 0:.1f}%) · '
-                f'V {r["volume_m3"]:.6f} m³ = {r["litres"]:.1f} L ({r["volume_pct"] or 0:.1f}%) · '
-                f'{r["tonnes"]:.4f} t'
-            )
-        if self.cal_result is not None and self.cal_result.errors:
-            self.log('  Note: this table has calibration errors and would not be sent.')
-        base_at_zero = clean_table(self.df['COL1'].tolist(), self.df['COL2'].tolist(), None)[1][0]
-        self.log(
-            f'  Dead_Volume = {header["Dead_Volume"]:g} m³ (sent separately, not included above). '
-            f'PLC may add Dead_Volume; base table already reads {base_at_zero:g} m³ at 0 m — '
-            f'check for double counting.'
-        )
+            self.log(self.cal_message)
 
     def _confirm_calibration(self):
         """Errors block sending; warnings need confirmation. Returns True to proceed."""
@@ -632,7 +501,7 @@ class CSVtoPLCApp:
             return True
         result = self.cal_result
         if result is None:
-            messagebox.showerror('Calibration', self.cal_status_text.get())
+            messagebox.showerror('Calibration', self.cal_message or 'Nothing to send')
             return False
         if result.errors:
             messagebox.showerror('Calibration errors — not sending', _format_issues(result.errors))
@@ -671,7 +540,7 @@ class CSVtoPLCApp:
             self.set_status('Stopping after current round…', 'darkorange')
             return
         if self.raw_df is None:
-            messagebox.showwarning('No file', 'Pick a CSV first.')
+            messagebox.showwarning('No file', 'Pick a tank file first.')
             return
         if not self._refresh_mapped_dataframe():
             messagebox.showwarning('Column mapping', self._column_mapping_error())
@@ -685,8 +554,9 @@ class CSVtoPLCApp:
             return
         self.sending_df = self.send_df
         self.sending_label = (
-            'sample data (no calibration)' if self.is_sample
-            else f'mode {self.cal_mode.get()}, calibration file {self.cal_filename or "none"}'
+            'sample data' if self.is_sample
+            else f'calibration sheet {self.cal_filename}' if self.cal_points
+            else 'base table'
         )
         self.is_sending = True
         self.stop_sending = False
@@ -810,7 +680,7 @@ class CSVtoPLCApp:
 def _format_issues(issues):
     shown = '\n'.join(f'• {i}' for i in issues[:MAX_LISTED_ISSUES])
     if len(issues) > MAX_LISTED_ISSUES:
-        shown += f'\n… and {len(issues) - MAX_LISTED_ISSUES} more (see Show comparison)'
+        shown += f'\n… and {len(issues) - MAX_LISTED_ISSUES} more'
     return shown
 
 

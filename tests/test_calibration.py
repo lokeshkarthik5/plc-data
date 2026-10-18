@@ -1,8 +1,9 @@
 import struct
+from pathlib import Path
 
 import pandas as pd
 import pytest
-from conftest import FO1_HEADER
+from conftest import FIXTURES, FO1_HEADER
 from hypothesis import example, given
 from hypothesis import strategies as st
 
@@ -13,6 +14,7 @@ from tankgauge.calibration import (
     calibrate,
     clean_table,
     interp,
+    load_tank_file,
     preview_reading,
     validate_calibration,
 )
@@ -265,3 +267,22 @@ def test_preview_volume_non_decreasing(fo1_base: Base, fo1_points: list[Point], 
         assert v_lo <= v_hi
 
     check()
+
+
+# ---- tank file ----
+
+def test_workbook_calibration_comes_from_second_sheet(fo1_points: list[Point]) -> None:
+    loaded = load_tank_file(str(Path(__file__).parents[1] / '1_FUEL OIL TANK 1.xlsx'))
+    assert list(loaded.table.columns) == ['Level_m', 'Volume_m3', 'Weight']
+    assert len(loaded.table) == 408
+    assert loaded.calibration_sheet == 'Sheet2'
+    assert loaded.points == fo1_points
+    assert loaded.points[0] == Point(0.0, 0.04)
+    assert loaded.points[-1] == Point(2.03, 13.0)
+
+
+def test_csv_sounding_table_has_no_calibration_sheet() -> None:
+    loaded = load_tank_file(str(FIXTURES / 'fo1_base.csv'))
+    assert len(loaded.table) == 408
+    assert loaded.points == []
+    assert loaded.calibration_sheet is None

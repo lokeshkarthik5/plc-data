@@ -1,6 +1,6 @@
 """Sounding-table calibration (docs/calibration-spec.md §2, §5).
 
-Pure logic, no Tkinter. pandas is used only in load_points_csv. All maths is
+Pure logic, no Tkinter. pandas is used only when reading a tank file. All maths is
 float64 with no rounding; float32 conversion happens when the packet is built.
 """
 
@@ -10,9 +10,11 @@ from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from statistics import median
 from typing import TypedDict
 
+import openpyxl
 import pandas as pd
 
 LEVEL_TOL_M = 0.001             # ±1 mm when matching levels against each other
@@ -281,10 +283,51 @@ def preview_reading(
     )
 
 
-def load_points_csv(path: str) -> list[Point]:
-    """Calibration points from the first two CSV columns (level, volume); non-numeric rows are skipped."""
-    df = pd.read_csv(path)
+@dataclass(frozen=True, slots=True)
+class TankFile:
+    """One tank input. The sounding table is the first sheet; calibration points are the second."""
+
+    table: pd.DataFrame
+    points: list[Point]
+    calibration_sheet: str | None
+
+
+def points_from_frame(df: pd.DataFrame) -> list[Point]:
+    """Calibration points from the first two columns (level, volume); non-numeric rows are skipped."""
     if df.shape[1] < 2:
-        raise ValueError(f'Calibration CSV needs 2 columns (level, volume), found {df.shape[1]}')
+        raise ValueError(f'Calibration sheet needs 2 columns (level, volume), found {df.shape[1]}')
     numeric = df.iloc[:, :2].apply(pd.to_numeric, errors='coerce').dropna()
     return [Point(float(lv), float(v)) for lv, v in numeric.itertuples(index=False)]
+
+
+def load_points_csv(path: str) -> list[Point]:
+    """Calibration points from the first two CSV columns (level, volume); non-numeric rows are skipped."""
+    return points_from_frame(pd.read_csv(path))
+
+
+def load_tank_file(path: str) -> TankFile:
+    """Load a tank workbook or CSV.
+
+    An Excel file keeps the sounding table on the first sheet and the calibration
+    points (level, corrected volume) on the second sheet. A CSV is the sounding
+    table only and has no calibration sheet.
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix in {'.xlsx', '.xlsm'}:
+        book = pd.read_excel(path, sheet_name=None, engine=openpyxl.__name__)
+        if not isinstance(book, dict) or not book:
+            raise ValueError(f'Workbook has no sheets: {path}')
+        names = list(book)
+        table = book[names[0]]
+        if not isinstance(table, pd.DataFrame):
+            raise ValueError(f'Sheet {names[0]!r} is not a table')
+        if len(names) < 2:
+            return TankFile(table=table, points=[], calibration_sheet=None)
+        cal_sheet = names[1]
+        cal_df = book[cal_sheet]
+        if not isinstance(cal_df, pd.DataFrame):
+            raise ValueError(f'Sheet {cal_sheet!r} is not a table')
+        return TankFile(table=table, points=points_from_frame(cal_df), calibration_sheet=cal_sheet)
+    if suffix == '.csv':
+        return TankFile(table=pd.read_csv(path), points=[], calibration_sheet=None)
+    raise ValueError(f'Unsupported tank file {Path(path).name}: use .xlsx or .csv')
