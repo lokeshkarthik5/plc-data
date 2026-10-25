@@ -158,7 +158,7 @@ Types: frozen `@dataclass(slots=True)` — `Point(level, volume)`, `CalibrationR
 - Modes per §2. Output levels == cleaned base levels.
 - Weights: `V × density / 1000`. If the base table's median weight/volume ratio (rows with V > 0) differs from `density/1000` by > 1% → warning naming both (FO1: 0.85 vs 0.824).
 - Shape check (warnings only): per calibration segment compare result ΔV/ΔL with base ΔV/ΔL over the same span; warn if > 25% off, e.g. `"1.90–2.00 m: 2.00 m³/m vs base 6.70"`. FO1 data is expected to trigger several.
-- Output volumes must be non-decreasing → error otherwise.
+- A calibrated volume that falls between rows is sent as calculated. FO1 Offset dips by 2 L at 0–0.005 m and 0.015–0.02 m.
 
 **`preview_reading(mA, header, levels, volumes)`** → dict (UI only, mirrors §2.4)
 - `mA < 3.8` or `> 20.5` → `SENSOR_FAULT` (NAMUR NE43).

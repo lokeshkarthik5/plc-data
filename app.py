@@ -9,7 +9,7 @@ import pandas as pd
 from tankgauge.calibration import Mode, calibrate, load_tank_file
 from tankgauge.packet import (
     COLUMN_LABELS,
-    NUM_COLUMNS,
+    NUM_COLUMNS, 
     NUM_HEADER_REALS,
     PLC_BUFFER_REALS,
     REAL_SIZE,

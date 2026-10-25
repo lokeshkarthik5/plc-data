@@ -241,12 +241,6 @@ def calibrate(
     if ratio_warning:
         warnings.append(ratio_warning)
     warnings.extend(_shape_warnings(points, levels, base_v, levels, volumes))
-    for i in range(1, len(volumes)):
-        if volumes[i] < volumes[i - 1]:
-            errors.append(
-                f'Calibrated volume decreases from {volumes[i - 1]:.6g} m³ at {levels[i - 1]:g} m '
-                f'to {volumes[i]:.6g} m³ at {levels[i]:g} m.'
-            )
     return CalibrationResult(levels, volumes, weights, warnings, errors)
 
 

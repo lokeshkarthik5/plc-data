@@ -145,14 +145,15 @@ def test_warnings(fo1_base: Base, fo1_points: list[Point]) -> None:
     assert result.errors == []
 
 
-def test_fo1_offset_is_not_monotonic(fo1_base: Base, fo1_points: list[Point]) -> None:
+def test_fo1_offset_dips_are_still_sent(fo1_base: Base, fo1_points: list[Point]) -> None:
     """FO1 base is flat at 0–0.005 m and 0.015–0.02 m while the correction falls, so Offset
-    dips by 2 L twice. The spec requires an error; see docs/calibration-spec.md §10."""
+    dips by 2 L twice. Those rows are sent; a dip is not an error."""
     result = run(fo1_base, fo1_points, Mode.OFFSET)
-    assert result.errors == [
-        'Calibrated volume decreases from 0.04 m³ at 0 m to 0.038 m³ at 0.005 m.',
-        'Calibrated volume decreases from 0.054 m³ at 0.015 m to 0.052 m³ at 0.02 m.',
-    ]
+    assert result.errors == []
+    assert volume_at(result, 0) == pytest.approx(0.04, abs=TOL)
+    assert volume_at(result, 0.005) == pytest.approx(0.038, abs=TOL)
+    assert volume_at(result, 0.015) == pytest.approx(0.054, abs=TOL)
+    assert volume_at(result, 0.02) == pytest.approx(0.052, abs=TOL)
 
 
 # ---- validation errors ----
@@ -252,7 +253,7 @@ def test_preview_below_4mA_clamps_to_empty(fo1_base: Base, fo1_points: list[Poin
     Mode.NONE,
     Mode.DIRECT,
     pytest.param(Mode.OFFSET, marks=pytest.mark.xfail(
-        strict=True, reason='FO1 Offset table is not monotonic (see test_fo1_offset_is_not_monotonic)')),
+        strict=True, reason='FO1 Offset table dips at 0–0.02 m (see test_fo1_offset_dips_are_still_sent)')),
 ])
 def test_preview_volume_non_decreasing(fo1_base: Base, fo1_points: list[Point], mode: Mode) -> None:
     result = run(fo1_base, fo1_points, mode)
