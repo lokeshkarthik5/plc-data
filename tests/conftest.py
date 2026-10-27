@@ -10,7 +10,7 @@ FIXTURES = Path(__file__).parent / 'fixtures'
 FO1_HEADER = [
     ('RTU_Number', 4.0),
     ('Tank_Number', 1.0),
-    ('Column_Size', 407.0),
+    ('Column_Size', 408.0),
     ('Sensor_Min_bar', 0.0),
     ('Sensor_Max_bar', 0.3),
     ('Density', 824.0),

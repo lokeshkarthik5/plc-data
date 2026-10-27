@@ -11,14 +11,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from statistics import median
 from typing import TypedDict
 
 import openpyxl
 import pandas as pd
 
 LEVEL_TOL_M = 0.001             # ±1 mm when matching levels against each other
-WEIGHT_RATIO_TOL = 0.01         # base weight/volume vs density/1000
 SHAPE_TOL = 0.25                # calibrated vs base cross-section per segment
 GRAVITY = 9.81
 PA_PER_BAR = 100000.0
@@ -41,8 +39,8 @@ class Point:
 @dataclass(frozen=True, slots=True)
 class CalibrationResult:
     levels: list[float]
-    volumes: list[float]
-    weights: list[float]
+    volumes: list[float]   # COL2: base sounding-table volumes
+    diffs: list[float]     # COL3: Diff.Vol = linearised corrected − base
     warnings: list[str]
     errors: list[str]
 
@@ -80,7 +78,7 @@ def _interp_clamped(levels: Sequence[float], values: Sequence[float], x: float) 
 def _clean_indices(
     levels: Sequence[float], volumes: Sequence[float], tank_height: float | None,
 ) -> tuple[list[int], list[str], list[str]]:
-    """Row indices kept after sorting by level and dropping exact duplicates."""
+    """Row indices kept after sorting by level. Exact duplicate rows are kept as loaded."""
     if len(levels) != len(volumes):
         raise ValueError('levels and volumes must be the same length')
     warnings: list[str] = []
@@ -90,17 +88,14 @@ def _clean_indices(
 
     order = sorted(range(len(levels)), key=lambda i: levels[i])
     kept: list[int] = []
-    dropped = 0
     for i in order:
         if kept:
             prev = kept[-1]
             if levels[i] == levels[prev]:
-                if volumes[i] == volumes[prev]:
-                    dropped += 1
-                    continue
-                errors.append(
-                    f'Level {levels[i]:g} m has two volumes: {volumes[prev]:g} and {volumes[i]:g} m³.'
-                )
+                if volumes[i] != volumes[prev]:
+                    errors.append(
+                        f'Level {levels[i]:g} m has two volumes: {volumes[prev]:g} and {volumes[i]:g} m³.'
+                    )
             elif volumes[i] < volumes[prev]:
                 errors.append(
                     f'Volume decreases from {volumes[prev]:g} m³ at {levels[prev]:g} m '
@@ -108,8 +103,6 @@ def _clean_indices(
                 )
         kept.append(i)
 
-    if dropped:
-        warnings.append(f'Dropped {dropped} duplicate row(s) from the base table.')
     if levels[kept[0]] != 0:
         errors.append(f'Base table must start at 0 m (first level is {levels[kept[0]]:g} m).')
     if tank_height is not None and abs(levels[kept[-1]] - tank_height) > LEVEL_TOL_M:
@@ -122,7 +115,7 @@ def _clean_indices(
 def clean_table(
     levels: Sequence[float], volumes: Sequence[float], tank_height: float | None,
 ) -> tuple[list[float], list[float], list[str], list[str]]:
-    """Sort by level, drop exact duplicate rows and check the table is usable.
+    """Sort by level and check the table is usable. Exact duplicate rows are kept.
 
     tank_height=None skips the top-of-table check.
     """
@@ -162,21 +155,6 @@ def validate_calibration(points: Sequence[Point], base_levels: Sequence[float]) 
     return errors
 
 
-def _weight_ratio_warning(
-    volumes: Sequence[float], weights: Sequence[float], density: float, action: str,
-) -> str | None:
-    ratios = [w / v for v, w in zip(volumes, weights, strict=True) if v > 0]
-    if not ratios:
-        return None
-    ratio = median(ratios)
-    expected = density / 1000
-    if expected > 0 and abs(ratio - expected) / expected <= WEIGHT_RATIO_TOL:
-        return None
-    return (
-        f'Base table weight/volume ratio is {ratio:.3f} but Density/1000 is {expected:.3f}; {action}.'
-    )
-
-
 def _shape_warnings(
     points: Sequence[Point],
     base_levels: Sequence[float], base_volumes: Sequence[float],
@@ -205,24 +183,23 @@ def calibrate(
     density: float,
     tank_height: float | None = None,
 ) -> CalibrationResult:
-    """Apply calibration points to the base table (spec §2).
+    """Build the sounding-table packet columns (Fuel_Oil_Tank_1 frame format).
 
-    Output levels are always the cleaned base levels. In NONE mode the cleaned
-    base volumes and weights are returned unchanged; otherwise weights are
-    V × density / 1000. tank_height is only used for the clean_table warning.
+    COL1/COL2 are always the cleaned base levels and volumes. With calibration
+    points, COL3 is Diff.Vol = linearised corrected volume − base volume
+    (Direct or Offset linearisation per mode). With mode NONE, Diff.Vol is 0.
+    density is unused for the table body (header only); tank_height is only
+    used for the clean_table warning.
     """
     if len(base_weights) != len(base_volumes):
         raise ValueError('base_volumes and base_weights must be the same length')
     kept, warnings, errors = _clean_indices(base_levels, base_volumes, tank_height)
     levels = [float(base_levels[i]) for i in kept]
     base_v = [float(base_volumes[i]) for i in kept]
-    base_w = [float(base_weights[i]) for i in kept]
+    _ = density  # header field; not applied to COL2/COL3
 
     if mode is Mode.NONE:
-        ratio_warning = _weight_ratio_warning(base_v, base_w, density, 'weights are sent as in the base table')
-        if ratio_warning:
-            warnings.append(ratio_warning)
-        return CalibrationResult(levels, base_v, base_w, warnings, errors)
+        return CalibrationResult(levels, base_v, [0.0] * len(levels), warnings, errors)
 
     errors.extend(validate_calibration(points, levels))
     if errors:
@@ -231,17 +208,13 @@ def calibrate(
     cal_levels = [p.level for p in points]
     if mode is Mode.OFFSET:
         corrections = [p.volume - _interp_clamped(levels, base_v, p.level) for p in points]
-        volumes = [b + _interp_clamped(cal_levels, corrections, lv) for lv, b in zip(levels, base_v, strict=True)]
+        revised = [b + _interp_clamped(cal_levels, corrections, lv) for lv, b in zip(levels, base_v, strict=True)]
     else:
         cal_volumes = [p.volume for p in points]
-        volumes = [_interp_clamped(cal_levels, cal_volumes, lv) for lv in levels]
-    weights = [v * density / 1000 for v in volumes]
-
-    ratio_warning = _weight_ratio_warning(base_v, base_w, density, 'weights are recalculated from Density')
-    if ratio_warning:
-        warnings.append(ratio_warning)
-    warnings.extend(_shape_warnings(points, levels, base_v, levels, volumes))
-    return CalibrationResult(levels, volumes, weights, warnings, errors)
+        revised = [_interp_clamped(cal_levels, cal_volumes, lv) for lv in levels]
+    diffs = [r - b for r, b in zip(revised, base_v, strict=True)]
+    warnings.extend(_shape_warnings(points, levels, base_v, levels, revised))
+    return CalibrationResult(levels, base_v, diffs, warnings, errors)
 
 
 def preview_reading(

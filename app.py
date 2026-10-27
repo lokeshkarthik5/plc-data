@@ -463,7 +463,7 @@ class CSVtoPLCApp:
             return None
 
     def _recalibrate(self, log=False):
-        """Rebuild the table to send. A second sheet is applied in offset mode; otherwise the base table is sent."""
+        """Rebuild the table to send: Level, base Volume_m3, Diff.Vol (Direct − base)."""
         self.cal_result = None
         self.send_df = None
         self.cal_message = ''
@@ -473,21 +473,19 @@ class CSVtoPLCApp:
         if self.is_sample:
             self.send_df = self.df
             return
-        mode = Mode.OFFSET if self.cal_points else Mode.NONE
-        density = self._header_float('density')
-        if mode is not Mode.NONE and (density is None or density <= 0):
-            self.cal_message = 'Density must be a positive number to calibrate'
-            return
+        # Direct linearisation of Sheet2 corrected volumes → Diff.Vol = revised − base.
+        mode = Mode.DIRECT if self.cal_points else Mode.NONE
+        density = self._header_float('density') or 0
 
         result = calibrate(
             self.df['COL1'].tolist(), self.df['COL2'].tolist(), self.df['COL3'].tolist(),
-            self.cal_points or [], mode, density or 0, tank_height=self._header_float('tank_height'),
+            self.cal_points or [], mode, density, tank_height=self._header_float('tank_height'),
         )
         self.cal_result = result
         if result.levels:
-            self.send_df = pd.DataFrame({'COL1': result.levels, 'COL2': result.volumes, 'COL3': result.weights})
+            self.send_df = pd.DataFrame({'COL1': result.levels, 'COL2': result.volumes, 'COL3': result.diffs})
 
-        what = 'Calibrated' if mode is not Mode.NONE else 'Base table'
+        what = 'Base + Diff.Vol' if mode is not Mode.NONE else 'Base table (Diff.Vol = 0)'
         self.cal_message = (
             f'{what} {len(result.levels)} rows · {len(result.warnings)} warnings · {len(result.errors)} errors'
         )
@@ -555,8 +553,8 @@ class CSVtoPLCApp:
         self.sending_df = self.send_df
         self.sending_label = (
             'sample data' if self.is_sample
-            else f'calibration sheet {self.cal_filename}' if self.cal_points
-            else 'base table'
+            else f'Level + Volume + Diff.Vol (sheet {self.cal_filename})' if self.cal_points
+            else 'Level + Volume + Diff.Vol=0'
         )
         self.is_sending = True
         self.stop_sending = False

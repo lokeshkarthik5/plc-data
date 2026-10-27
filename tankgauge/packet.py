@@ -30,9 +30,9 @@ def build_combined_packet(header_values: Sequence[tuple[str, float]], df: pd.Dat
         [5]                Density
         [6]                Dead_Volume
         [7]                Tank_Height
-        [8 .. 8+N-1]       COL1 (all rows)
-        [8+N .. 8+2N-1]    COL2 (all rows)
-        [8+2N .. 8+3N-1]   COL3 (all rows)
+        [8 .. 8+N-1]       COL1 = Level_m (all rows)
+        [8+N .. 8+2N-1]    COL2 = Volume_m3 base sounding table (all rows)
+        [8+2N .. 8+3N-1]   COL3 = Diff.Vol (linearised corrected − base)
     """
     floats = [float(value) for _label, value in header_values]
     for col in range(NUM_COLUMNS):

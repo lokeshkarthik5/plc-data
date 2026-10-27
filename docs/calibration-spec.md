@@ -11,8 +11,8 @@ float32 LE, column-major
 [0] RTU_Number  [1] Tank_Number  [2] Column_Size  [3] Sensor_Min_bar
 [4] Sensor_Max_bar  [5] Density  [6] Dead_Volume  [7] Tank_Height
 [8 .. 8+N-1]      COL1 = level (m)
-[8+N .. 8+2N-1]   COL2 = volume (m³)
-[8+2N .. 8+3N-1]  COL3 = weight (t)
+[8+N .. 8+2N-1]   COL2 = base volume (m³)
+[8+2N .. 8+3N-1]  COL3 = Diff.Vol (linearised corrected − base)
 ```
 
 The **PLC** converts mA → level and interpolates volume from this table. This tool does not compute volumes at runtime.
@@ -31,7 +31,7 @@ Inputs:
 - **Base table** — shipyard sounding table, (level, volume) every 5 mm. FO Tank 1: 408 rows, 0 → 2.03 m.
 - **Calibration points** — (level, corrected volume) measured on site, every 0.1 m. FO Tank 1: 22 points.
 
-Output levels are **always the base table's levels** (same 5 mm grid, same row count after de-duplication). Only volumes and weights change.
+Output levels and COL2 volumes are **always the base table**. COL3 is Diff.Vol so the PLC can form revised volume = base + Diff.Vol.
 
 ### 2.1 Offset mode (default)
 
@@ -90,7 +90,7 @@ Both modes equal the corrected volume exactly at every calibration level.
 
 ### 2.3 None mode
 
-Base volumes unchanged (still de-duplicated).
+Base volumes unchanged (exact duplicate rows are kept).
 
 ### 2.4 What the PLC then does (for the preview panel only)
 
@@ -139,12 +139,12 @@ requirements-dev.txt        pytest, hypothesis, ruff, mypy
 
 ## 5. calibration.py
 
-Types: frozen `@dataclass(slots=True)` — `Point(level, volume)`, `CalibrationResult(levels, volumes, weights, warnings: list[str], errors: list[str])`. `Mode(StrEnum)`: `NONE`, `OFFSET`, `DIRECT`. Python 3.11+, float64 internally, no rounding.
+Types: frozen `@dataclass(slots=True)` — `Point(level, volume)`, `CalibrationResult(levels, volumes, diffs, warnings: list[str], errors: list[str])`. `Mode(StrEnum)`: `NONE`, `OFFSET`, `DIRECT`. Python 3.11+, float64 internally, no rounding.
 
 **`interp(levels, values, x)`** — `bisect_right` to find `levels[i] ≤ x < levels[i+1]`; linear interpolation; `x == levels[-1]` returns last value; out of range → `ValueError`; never index past the end.
 
 **`clean_table(levels, volumes, tank_height)`** → `(levels, volumes, warnings, errors)`
-- Sort by level; drop exact duplicate rows (warn with count). FO1 has a duplicated final 2.03 row — a zero-width segment can divide by zero in the PLC.
+- Sort by level; keep exact duplicate rows (FO1 ends with two identical 2.03 m rows → 408 sent).
 - Same level, different volume → error.
 - Volume decreasing with level → error.
 - First level ≠ 0 → error.
@@ -155,10 +155,9 @@ Types: frozen `@dataclass(slots=True)` — `Point(level, volume)`, `CalibrationR
 - Must include first and last base level (±1 mm) → otherwise error. Never extrapolate.
 
 **`calibrate(base_levels, base_volumes, base_weights, points, mode, density)`** → `CalibrationResult`
-- Modes per §2. Output levels == cleaned base levels.
-- Weights: `V × density / 1000`. If the base table's median weight/volume ratio (rows with V > 0) differs from `density/1000` by > 1% → warning naming both (FO1: 0.85 vs 0.824).
-- Shape check (warnings only): per calibration segment compare result ΔV/ΔL with base ΔV/ΔL over the same span; warn if > 25% off, e.g. `"1.90–2.00 m: 2.00 m³/m vs base 6.70"`. FO1 data is expected to trigger several.
-- A calibrated volume that falls between rows is sent as calculated. FO1 Offset dips by 2 L at 0–0.005 m and 0.015–0.02 m.
+- Modes per §2 for the linearised corrected volume. COL2 is always cleaned base volumes. COL3 = Diff.Vol = revised − base (0 in NONE mode). UI send path uses Direct so Diff.Vol matches Fuel_Oil_Tank_1.
+- Shape check (warnings only): per calibration segment compare revised ΔV/ΔL with base ΔV/ΔL over the same span; warn if > 25% off, e.g. `"1.90–2.00 m: 2.00 m³/m vs base 6.70"`. FO1 data is expected to trigger several.
+- FO1 Offset revised volume dips by 2 L at 0–0.005 m and 0.015–0.02 m; COL2 stays the base table.
 
 **`preview_reading(mA, header, levels, volumes)`** → dict (UI only, mirrors §2.4)
 - `mA < 3.8` or `> 20.5` → `SENSOR_FAULT` (NAMUR NE43).
@@ -175,8 +174,8 @@ Types: frozen `@dataclass(slots=True)` — `Point(level, volume)`, `CalibrationR
    - "Load calibration CSV…" button + file label.
    - Mode combobox: None / Offset (recommended) / Direct.
    - "Show comparison" → log per calibration level: base V, calibrated V, Δ; then per-segment area vs base; then all warnings.
-   - Status line: `Calibrated 407 rows · 6 warnings · 0 errors` (red errors / orange warnings / green clean).
-3. **Send path** — packet built from calibrated table when mode ≠ None, else from cleaned base table (de-dup always applies). `Column_Size` = calibrated row count. Errors block send (`showerror`). Warnings need `askyesno` listing up to 10. Log mode + calibration filename at session start. Same `build_combined_packet`, group/port, single packet per round, `ROUND_DELAY_SEC`, Stop behaviour.
+   - Status line: `Calibrated 408 rows · 6 warnings · 0 errors` (red errors / orange warnings / green clean).
+3. **Send path** — packet built from calibrated table when mode ≠ None, else from cleaned base table. `Column_Size` = calibrated row count. Errors block send (`showerror`). Warnings need `askyesno` listing up to 10. Log mode + calibration filename at session start. Same `build_combined_packet`, group/port, single packet per round, `ROUND_DELAY_SEC`, Stop behaviour.
 4. **Check reading** — mA entry + "Check" button → logs `preview_reading` for the table selected for sending. Show Dead_Volume separately with note: *"PLC may add Dead_Volume; base table already reads 0.03 m³ at 0 m — check for double counting."*
 5. Recalibrate on change of CSV, column mapping, calibration file, mode, or Density. Synchronous is fine.
 6. Networking code untouched except the data source.
@@ -185,16 +184,16 @@ Types: frozen `@dataclass(slots=True)` — `Point(level, volume)`, `CalibrationR
 
 Fixtures: `tests/fixtures/fo1_base.csv`, `tests/fixtures/fo1_calibration.csv`.
 
-- `clean_table`: 408 → 407 rows, 1 duplicate dropped, last level 2.03.
+- `clean_table`: FO1 keeps all 408 rows, including the duplicated final 2.03 m row.
 - Offset and Direct equal the calibration volume at every calibration level.
 - At 0.05 m: Direct 0.135, Offset 0.100, None 0.110.
 - Worked rows in §2.1 (0.11 → 0.275, 0.15 → 0.505, 0.18 → 0.700) in Offset.
 - Output levels identical to cleaned base levels in every mode.
-- Calibrated FO1 packet = 8 + 3×407 = 1229 REALs (≤ `PLC_BUFFER_REALS` 1361); header unchanged; decoded COL2 == calibrated volumes within float32 precision.
+- Calibrated FO1 packet = 8 + 3×408 = 1232 REALs (≤ `PLC_BUFFER_REALS` 1361); header unchanged; decoded COL2 == calibrated volumes within float32 precision.
 - Calibrated vs raw send of the same base table differ only in COL2/COL3 sections.
 - `preview_reading` 4.5 mA FO1: level 0.115978; None 0.313911, Direct 0.329063, Offset 0.307878.
 - 3.5 / 21 mA → `SENSOR_FAULT`; 15 mA → `OVER_RANGE`, level 2.03.
-- Warnings include weight/density mismatch and ≥ 1 shape-check warning.
+- Warnings include ≥ 1 shape-check warning.
 - Errors: calibration missing 2.03; decreasing calibration volume; same level two volumes.
 - Hypothesis: random mA in [4, 20] → volume non-decreasing in all modes.
 - `SAMPLE_CSV_ROWS` packet bytes identical before/after refactor — capture the hex from current code first, hard-code it.
